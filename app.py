@@ -59,27 +59,23 @@ CALIBRATION_FILE = os.path.join(os.path.dirname(__file__), "calibration.json")
 # =============================================================================
 # HARDWARE IMPORTS
 # =============================================================================
+# Using gpiozero for Raspberry Pi 5 compatibility (RPi.GPIO does NOT work on Pi 5)
 try:
-    import RPi.GPIO as GPIO
+    from gpiozero import OutputDevice
     GPIO_AVAILABLE = True
 except ImportError:
     GPIO_AVAILABLE = False
-    class MockGPIO:
-        BCM = "BCM"
-        OUT = "OUT"
-        HIGH = 1
-        LOW = 0
-        @staticmethod
-        def setmode(mode): pass
-        @staticmethod
-        def setwarnings(val): pass
-        @staticmethod
-        def setup(pin, mode): pass
-        @staticmethod
-        def output(pin, val): pass
-        @staticmethod
-        def cleanup(): pass
-    GPIO = MockGPIO()
+    # Mock for development on non-Pi systems
+    class OutputDevice:
+        def __init__(self, pin, initial_value=False):
+            self.pin = pin
+            self.value = 1 if initial_value else 0
+        def on(self):
+            self.value = 1
+        def off(self):
+            self.value = 0
+        def close(self):
+            pass
 
 try:
     from picamera2 import Picamera2, Preview
@@ -243,46 +239,57 @@ def print_side_by_side(left, right, left_width=55):
 # MOTOR CONTROLLER
 # =============================================================================
 class MotorController:
+    """Controls NEMA 23 stepper motor via DM556 driver using gpiozero (Pi 5 compatible)."""
+    
     def __init__(self):
         self.current_angle = 0.0
         self.is_enabled = False
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setwarnings(False)
-        GPIO.setup(CONFIG.GPIO_PULSE, GPIO.OUT)
-        GPIO.setup(CONFIG.GPIO_DIRECTION, GPIO.OUT)
-        GPIO.setup(CONFIG.GPIO_ENABLE, GPIO.OUT)
-        GPIO.output(CONFIG.GPIO_PULSE, GPIO.LOW)
-        GPIO.output(CONFIG.GPIO_DIRECTION, GPIO.LOW)
-        GPIO.output(CONFIG.GPIO_ENABLE, GPIO.HIGH)
+        
+        # Initialize GPIO pins using gpiozero OutputDevice
+        # initial_value=False means pin starts LOW, True means HIGH
+        self.pulse_pin = OutputDevice(CONFIG.GPIO_PULSE, initial_value=False)
+        self.direction_pin = OutputDevice(CONFIG.GPIO_DIRECTION, initial_value=False)
+        self.enable_pin = OutputDevice(CONFIG.GPIO_ENABLE, initial_value=True)  # HIGH = disabled
     
     def enable(self):
-        GPIO.output(CONFIG.GPIO_ENABLE, GPIO.LOW)
+        """Enable motor driver (ENA is active LOW on DM556)."""
+        self.enable_pin.off()  # LOW = enabled
         self.is_enabled = True
         time.sleep(0.01)
     
     def disable(self):
-        GPIO.output(CONFIG.GPIO_ENABLE, GPIO.HIGH)
+        """Disable motor driver."""
+        self.enable_pin.on()  # HIGH = disabled
         self.is_enabled = False
     
     def step(self, num_steps, delay_us=None):
+        """Execute step pulses."""
         if delay_us is None:
             delay_us = CONFIG.PULSE_DELAY_US
         delay_s = delay_us / 1_000_000
         for _ in range(num_steps):
-            GPIO.output(CONFIG.GPIO_PULSE, GPIO.HIGH)
+            self.pulse_pin.on()
             time.sleep(delay_s)
-            GPIO.output(CONFIG.GPIO_PULSE, GPIO.LOW)
+            self.pulse_pin.off()
             time.sleep(delay_s)
             time.sleep(CONFIG.STEP_DELAY_MS / 1000)
     
     def rotate_degrees(self, degrees, clockwise=True):
+        """Rotate motor by specified degrees."""
         if not self.is_enabled:
             self.enable()
         calibrated = degrees * CONFIG.CALIBRATION_FACTOR
         steps = round(calibrated / CONFIG.DEGREES_PER_STEP)
-        GPIO.output(CONFIG.GPIO_DIRECTION, 1 if clockwise else 0)
+        
+        # Set direction
+        if clockwise:
+            self.direction_pin.on()
+        else:
+            self.direction_pin.off()
         time.sleep(0.001)
+        
         self.step(steps)
+        
         if clockwise:
             self.current_angle = (self.current_angle + degrees) % 360
         else:
@@ -290,15 +297,20 @@ class MotorController:
         return degrees
     
     def rotate_increment(self):
+        """Rotate by configured increment."""
         self.rotate_degrees(CONFIG.ROTATION_INCREMENT, clockwise=True)
         return self.current_angle
     
     def reset_position(self):
+        """Reset angle tracking to zero."""
         self.current_angle = 0.0
     
     def cleanup(self):
+        """Release GPIO resources."""
         self.disable()
-        GPIO.cleanup()
+        self.pulse_pin.close()
+        self.direction_pin.close()
+        self.enable_pin.close()
 
 # =============================================================================
 # CAMERA CONTROLLER
