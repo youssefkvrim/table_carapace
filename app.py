@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import json
+import threading
 from datetime import datetime
 
 # =============================================================================
@@ -90,6 +91,12 @@ try:
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
+
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
 
 # =============================================================================
 # ASCII ART
@@ -226,8 +233,15 @@ def save_calibration(factor):
 
 def print_side_by_side(left, right, left_width=55):
     """Print two multi-line strings side by side."""
-    left_lines = left.strip().split('\n')
+    left_lines = left.split('\n')
     right_lines = right.strip().split('\n')
+    
+    # Remove empty first/last lines from left (preserves internal spacing)
+    if left_lines and left_lines[0] == '':
+        left_lines = left_lines[1:]
+    if left_lines and left_lines[-1] == '':
+        left_lines = left_lines[:-1]
+    
     max_lines = max(len(left_lines), len(right_lines))
     
     for i in range(max_lines):
@@ -316,10 +330,16 @@ class MotorController:
 # CAMERA CONTROLLER
 # =============================================================================
 class CameraController:
+    """Camera controller with live preview support via OpenCV or native Picamera2."""
+    
+    PREVIEW_WINDOW = "Camera Preview - Press Q to close"
+    
     def __init__(self):
         self.camera = None
         self.is_initialized = False
         self.preview_active = False
+        self.preview_thread = None
+        self.stop_preview_flag = False
         
         if CAMERA_AVAILABLE:
             self._initialize()
@@ -327,10 +347,9 @@ class CameraController:
     def _initialize(self):
         try:
             self.camera = Picamera2()
-            # Create configuration with both main (for capture) and lores (for preview)
             config = self.camera.create_still_configuration(
                 main={"size": CONFIG.CAMERA_RESOLUTION, "format": "RGB888"},
-                lores={"size": CONFIG.CAMERA_PREVIEW_SIZE, "format": "YUV420"},
+                lores={"size": CONFIG.CAMERA_PREVIEW_SIZE, "format": "RGB888"},
                 buffer_count=2
             )
             self.camera.configure(config)
@@ -346,23 +365,62 @@ class CameraController:
             self.camera = None
     
     def start_preview(self):
-        """Start live video preview window."""
+        """Start live video preview window using OpenCV or native preview."""
         if not CAMERA_AVAILABLE or not self.is_initialized:
             print("  [CAMERA] Not available - running in mock mode")
             return False
         
+        # Prefer OpenCV for reliable cross-platform preview
+        if CV2_AVAILABLE:
+            return self._start_opencv_preview()
+        
+        # Fallback to native Picamera2 preview
+        return self._start_native_preview()
+    
+    def _start_opencv_preview(self):
+        """Start preview using OpenCV window (non-blocking via thread)."""
+        self.stop_preview_flag = False
+        self.preview_thread = threading.Thread(target=self._opencv_preview_loop, daemon=True)
+        self.preview_thread.start()
+        self.preview_active = True
+        return True
+    
+    def _opencv_preview_loop(self):
+        """OpenCV preview loop running in separate thread."""
+        cv2.namedWindow(self.PREVIEW_WINDOW, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self.PREVIEW_WINDOW, 800, 600)
+        
+        while not self.stop_preview_flag:
+            try:
+                # Capture low-res frame for preview
+                frame = self.camera.capture_array("lores")
+                # Convert RGB to BGR for OpenCV
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                cv2.imshow(self.PREVIEW_WINDOW, frame_bgr)
+                
+                key = cv2.waitKey(30) & 0xFF
+                if key == ord('q'):
+                    break
+            except Exception:
+                break
+        
+        cv2.destroyAllWindows()
+    
+    def _start_native_preview(self):
+        """Start preview using Picamera2 native preview."""
         try:
-            # Try Qt preview first (works on desktop), fall back to DRM (works on Pi without desktop)
             try:
                 self.camera.start_preview(Preview.QT, x=100, y=100, width=800, height=600)
             except Exception:
                 try:
-                    self.camera.start_preview(Preview.DRM, x=100, y=100, width=800, height=600)
+                    self.camera.start_preview(Preview.QTGL, x=100, y=100, width=800, height=600)
                 except Exception:
-                    # Last resort: NULL preview (no display but camera runs)
-                    self.camera.start_preview(Preview.NULL)
-                    print("  [CAMERA] Preview window not available on this system")
-                    return False
+                    try:
+                        self.camera.start_preview(Preview.DRM, x=100, y=100, width=800, height=600)
+                    except Exception:
+                        self.camera.start_preview(Preview.NULL)
+                        print("  [CAMERA] Preview window not available on this system")
+                        return False
             
             self.preview_active = True
             return True
@@ -372,12 +430,24 @@ class CameraController:
     
     def stop_preview(self):
         """Stop live video preview."""
+        self.stop_preview_flag = True
+        
+        if self.preview_thread and self.preview_thread.is_alive():
+            self.preview_thread.join(timeout=1.0)
+        
+        if CV2_AVAILABLE:
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
+        
         if self.preview_active and self.camera:
             try:
                 self.camera.stop_preview()
             except Exception:
                 pass
-            self.preview_active = False
+        
+        self.preview_active = False
     
     def capture(self, filepath):
         """Capture and save an image."""
@@ -624,12 +694,11 @@ class Application:
         print("\n" + "=" * 100)
         print("                                CAMERA TEST - LIVE PREVIEW")
         print("=" * 100)
-        print("\n  Opening live video feed. Press Ctrl+C to stop.\n")
         
         self.camera = CameraController()
         
         if not self.camera.is_initialized and CAMERA_AVAILABLE:
-            print("  Camera not initialized. Check connection.")
+            print("\n  Camera not initialized. Check connection.")
             input("\n  Press ENTER to continue...")
             return
         
@@ -637,18 +706,28 @@ class Application:
         preview_ok = self.camera.start_preview()
         
         if preview_ok:
-            print("  [PREVIEW] Live video window is now open.")
-            print("  [PREVIEW] You should see the camera feed in a separate window.")
+            if CV2_AVAILABLE:
+                print("\n  [PREVIEW] Live video window opened (OpenCV)")
+                print("  [PREVIEW] Press 'Q' in the preview window OR Ctrl+C here to stop")
+            else:
+                print("\n  [PREVIEW] Live video window opened (native)")
+                print("  [PREVIEW] Press Ctrl+C to stop")
         else:
-            print("  [PREVIEW] Could not open preview window.")
+            print("\n  [PREVIEW] Could not open preview window.")
             if not CAMERA_AVAILABLE:
                 print("  [PREVIEW] Camera hardware not detected (mock mode).")
         
-        print("\n  Press Ctrl+C to stop and return to menu...\n")
+        print("\n  Streaming live video...\n")
         
         try:
             frame = 0
             while True:
+                # Check if OpenCV preview thread stopped (user pressed Q)
+                if CV2_AVAILABLE and self.camera.preview_thread:
+                    if not self.camera.preview_thread.is_alive():
+                        print("\n\n  Preview window closed.")
+                        break
+                
                 frame += 1
                 status = self.camera.get_status()
                 print(f"\r  [LIVE] Frame {frame:05d} | {status}          ", end="", flush=True)

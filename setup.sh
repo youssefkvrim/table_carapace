@@ -23,7 +23,7 @@ echo ""
 echo "[3/5] Installing Python packages..."
 # Note: gpiozero is pre-installed on Raspberry Pi OS and works with Pi 5
 # RPi.GPIO does NOT work with Raspberry Pi 5
-pip3 install --user Pillow --break-system-packages 2>/dev/null || pip3 install --user Pillow
+pip3 install --user Pillow opencv-python --break-system-packages 2>/dev/null || pip3 install --user Pillow opencv-python
 
 echo ""
 echo "[4/5] Creating directories..."
