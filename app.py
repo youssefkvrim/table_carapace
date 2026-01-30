@@ -101,49 +101,6 @@ except ImportError:
 # =============================================================================
 # ASCII ART
 # =============================================================================
-LOGO = r"""
-               . ....---------:.....               
-            ...------===============-..            
-         ..=======-......   ....-======+..         
-       .=====......                ...+++++..      
-     .====...====...                   ..=+++..    
-    :++..======..                         ..**+.   
- ..++..=======..                             .**.. 
-..+..========-.                                .*..
-.+..=========#.                                 ...
-  .===========*...                                 
-  .===============#....                            
-  .================++++*#....                      
-  ..==============++++++++**+*#....                
-   ..+===========++++++++*******++=#+..            
-     ..+========++++++++************++=-#.. .      
-       ..-*====++++++++*****************+==#..     
-            .**+++++++******************##*++=..   
-               ...*#*******************#####***=.  
-                   ....-###**********##########*.  
-                           ...###***############.  
-                                ...%%###########.  
-.#..                               .*%#########..*.
- .#.                                .%########..#. 
- ..##..                            .*#######..##.  
-    .##..                         .%#####*..##:    
-     .+***....                ...:####...****..    
-       ..***+=..               ......:****+.       
-         ..+*++++++:...........:=++++++*.          
-            ...+++++===========+++++..             
-                 .....=======......                
-"""
-
-COMPANY_NAME = '''.dP"Y8    db    888888 88""Yb    db    88b 88
-`Ybo."   dPYb   88__   88__dP   dPYb   88Yb88
-o.`Y8b  dP__Yb  88""   88"Yb   dP__Yb  88 Y88
-8bodP' dP""""Yb 88     88  Yb dP""""Yb 88  Y8
-
-88""Yb 888888 Yb  dP
-88__dP 88__    YbdP 
-88"""  88""    dPYb 
-88     88     dP  Yb'''
-
 PROJECT_TITLE = r"""
  /$$$$$$$$        /$$       /$$                  /$$$$$$                        /$$                         /$$                 
 |__  $$__/       | $$      | $$                 /$$__  $$                      | $$                        | $$                 
@@ -230,24 +187,6 @@ def save_calibration(factor):
         return True
     except Exception:
         return False
-
-def print_side_by_side(left, right, left_width=55):
-    """Print two multi-line strings side by side."""
-    left_lines = left.split('\n')
-    right_lines = right.strip().split('\n')
-    
-    # Remove empty first/last lines from left (preserves internal spacing)
-    if left_lines and left_lines[0] == '':
-        left_lines = left_lines[1:]
-    if left_lines and left_lines[-1] == '':
-        left_lines = left_lines[:-1]
-    
-    max_lines = max(len(left_lines), len(right_lines))
-    
-    for i in range(max_lines):
-        left_line = left_lines[i] if i < len(left_lines) else ""
-        right_line = right_lines[i] if i < len(right_lines) else ""
-        print(f"{left_line:<{left_width}} {right_line}")
 
 # =============================================================================
 # MOTOR CONTROLLER
@@ -408,25 +347,36 @@ class CameraController:
     
     def _start_native_preview(self):
         """Start preview using Picamera2 native preview."""
-        try:
+        # Native preview requires Qt/GTK event loop which conflicts with terminal apps
+        # This is a fallback only - OpenCV preview is preferred
+        preview_types = []
+        if Preview is not None:
+            preview_types = [
+                ("DRM", getattr(Preview, "DRM", None)),      # Direct rendering - no event loop needed
+                ("QT", getattr(Preview, "QT", None)),        # Qt-based
+                ("QTGL", getattr(Preview, "QTGL", None)),    # Qt OpenGL
+            ]
+        
+        for name, preview_type in preview_types:
+            if preview_type is None:
+                continue
             try:
-                self.camera.start_preview(Preview.QT, x=100, y=100, width=800, height=600)
+                self.camera.start_preview(preview_type, x=100, y=100, width=800, height=600)
+                self.preview_active = True
+                return True
+            except RuntimeError as e:
+                if "event loop" in str(e).lower():
+                    # Event loop conflict - skip all Qt-based previews
+                    print(f"  [CAMERA] {name} preview skipped: event loop conflict")
+                    if name in ("QT", "QTGL"):
+                        continue
+                continue
             except Exception:
-                try:
-                    self.camera.start_preview(Preview.QTGL, x=100, y=100, width=800, height=600)
-                except Exception:
-                    try:
-                        self.camera.start_preview(Preview.DRM, x=100, y=100, width=800, height=600)
-                    except Exception:
-                        self.camera.start_preview(Preview.NULL)
-                        print("  [CAMERA] Preview window not available on this system")
-                        return False
-            
-            self.preview_active = True
-            return True
-        except Exception as e:
-            print(f"  [CAMERA] Preview failed: {e}")
-            return False
+                continue
+        
+        # All previews failed
+        print("  [CAMERA] Preview window not available - running without preview")
+        return False
     
     def stop_preview(self):
         """Stop live video preview."""
@@ -547,17 +497,14 @@ class Application:
         load_calibration()
     
     def show_header(self):
-        """Display the persistent header with logo, company, license, and title."""
+        """Display the persistent header with project title and license."""
         clear_screen()
-        
-        # Logo and company name side by side
-        print_side_by_side(LOGO, COMPANY_NAME, left_width=55)
-        
-        # License text
-        print(LICENSE_TEXT)
         
         # Project title
         print(PROJECT_TITLE)
+        
+        # License text
+        print(LICENSE_TEXT)
     
     def show_main_menu(self):
         """Display main menu options."""
