@@ -292,6 +292,7 @@ class CameraController:
         # Video recording state
         self.video_writer = None
         self.video_recording = False
+        self.video_frame_count = 0
         self.current_angle = 0
         
         if CAMERA_AVAILABLE:
@@ -379,15 +380,18 @@ class CameraController:
                         break
                     continue
                 
+                # Picamera2 lores often outputs RGB despite BGR888 setting - convert to BGR for OpenCV
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                
                 error_count = 0  # Reset on successful frame
                 frame_count += 1
                 
                 # Record frame to video if recording is active
                 if self.video_recording:
-                    self.record_frame(frame)
+                    self.record_frame(frame_bgr)
                 
                 # Add angle overlay to preview display
-                display_frame = self.add_angle_overlay(frame.copy(), self.current_angle, is_still=False)
+                display_frame = self.add_angle_overlay(frame_bgr.copy(), self.current_angle, is_still=False)
                 cv2.imshow(self.PREVIEW_WINDOW, display_frame)
                 
                 # 16ms = ~60fps max, but actual fps limited by camera
@@ -557,13 +561,25 @@ class CameraController:
         if not CV2_AVAILABLE:
             return False
         try:
-            # Use H264 codec with mp4 container
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            fps = 20  # Target framerate
-            frame_size = CONFIG.CAMERA_PREVIEW_SIZE
-            self.video_writer = cv2.VideoWriter(filepath, fourcc, fps, frame_size)
-            self.video_recording = True
-            return True
+            # Try multiple codecs - mp4v is most compatible
+            codecs = ['mp4v', 'avc1', 'XVID', 'MJPG']
+            fps = 15  # Lower fps for reliability
+            # VideoWriter expects (width, height)
+            frame_size = (CONFIG.CAMERA_PREVIEW_SIZE[0], CONFIG.CAMERA_PREVIEW_SIZE[1])
+            
+            for codec in codecs:
+                fourcc = cv2.VideoWriter_fourcc(*codec)
+                self.video_writer = cv2.VideoWriter(filepath, fourcc, fps, frame_size)
+                if self.video_writer.isOpened():
+                    self.video_recording = True
+                    self.video_frame_count = 0
+                    print(f"  [VIDEO] Using codec: {codec}")
+                    return True
+                self.video_writer.release()
+            
+            print("  [VIDEO] No compatible codec found")
+            self.video_writer = None
+            return False
         except Exception as e:
             print(f"  [VIDEO] Failed to start recording: {e}")
             return False
@@ -572,15 +588,26 @@ class CameraController:
         """Record a single frame with angle overlay to video."""
         if not self.video_recording or self.video_writer is None:
             return
+        if not self.video_writer.isOpened():
+            return
         try:
+            # Verify frame dimensions match expected size
+            h, w = frame.shape[:2]
+            expected_w, expected_h = CONFIG.CAMERA_PREVIEW_SIZE
+            if w != expected_w or h != expected_h:
+                frame = cv2.resize(frame, (expected_w, expected_h))
+            
             # Add angle overlay
             frame_with_overlay = self.add_angle_overlay(frame.copy(), self.current_angle, is_still=False)
             self.video_writer.write(frame_with_overlay)
-        except Exception:
+            self.video_frame_count += 1
+        except Exception as e:
             pass
     
     def stop_video_recording(self):
         """Stop video recording and release writer."""
+        was_recording = self.video_recording
+        frame_count = getattr(self, 'video_frame_count', 0)
         self.video_recording = False
         if self.video_writer is not None:
             try:
@@ -588,6 +615,8 @@ class CameraController:
             except Exception:
                 pass
             self.video_writer = None
+        if was_recording:
+            print(f"  [VIDEO] Recorded {frame_count} frames")
     
     def get_status(self):
         """Get current camera status info."""
@@ -628,6 +657,7 @@ class CameraController:
         self.stop_preview_flag = False
         self.video_writer = None
         self.video_recording = False
+        self.video_frame_count = 0
         self.current_angle = 0
         
         # Force garbage collection to release camera resources
