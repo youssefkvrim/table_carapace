@@ -288,7 +288,6 @@ class CameraController:
         self.preview_active = False
         self.preview_thread = None
         self.stop_preview_flag = False
-        self.still_config = None  # High-res capture configuration
         
         # Video recording state
         self.video_writer = None
@@ -301,27 +300,26 @@ class CameraController:
     def _initialize(self):
         try:
             self.camera = Picamera2()
-            # Use video configuration for smooth preview streaming
-            # BGR888 format matches OpenCV native format - no conversion needed
-            preview_config = self.camera.create_video_configuration(
-                main={"size": CONFIG.CAMERA_PREVIEW_SIZE, "format": "BGR888"},
-                buffer_count=4  # More buffers = smoother streaming
+            # Single configuration with both streams from SAME sensor mode:
+            # - main: full resolution for capture (what you save)
+            # - lores: scaled down for preview (exact same framing/colors)
+            # Using BGR888 for both since OpenCV expects BGR
+            config = self.camera.create_still_configuration(
+                main={"size": CONFIG.CAMERA_RESOLUTION, "format": "BGR888"},
+                lores={"size": CONFIG.CAMERA_PREVIEW_SIZE, "format": "BGR888"},
+                buffer_count=4,
+                queue=True,  # Enable frame queueing for smoother preview
             )
-            # Still configuration for high-res capture
-            self.still_config = self.camera.create_still_configuration(
-                main={"size": CONFIG.CAMERA_RESOLUTION, "format": "RGB888"},
-            )
-            self.camera.configure(preview_config)
+            self.camera.configure(config)
             self.camera.set_controls({
                 "AfMode": controls.AfModeEnum.Continuous,
                 "AfSpeed": controls.AfSpeedEnum.Normal,
-                # Lock AWB after stabilization for consistent colors
                 "AwbEnable": True,
             })
             self.camera.start()
-            # Wait for AWB/AEC to stabilize (critical for color consistency)
+            # Wait for AWB/AEC to stabilize
             print("  [CAMERA] Waiting for auto-exposure to stabilize...")
-            time.sleep(3)
+            time.sleep(2)
             self.is_initialized = True
         except Exception as e:
             print(f"  [CAMERA] Init failed: {e}")
@@ -351,8 +349,16 @@ class CameraController:
     def _opencv_preview_loop(self):
         """OpenCV preview loop running in separate thread."""
         try:
+            # Destroy any stale window with same name first
+            cv2.destroyWindow(self.PREVIEW_WINDOW)
+            cv2.waitKey(1)
+        except Exception:
+            pass
+        
+        try:
             cv2.namedWindow(self.PREVIEW_WINDOW, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(self.PREVIEW_WINDOW, 800, 600)
+            cv2.waitKey(1)  # Flush window creation
         except Exception as e:
             print(f"  [CAMERA] Failed to create preview window: {e}")
             return
@@ -363,8 +369,8 @@ class CameraController:
         
         while not self.stop_preview_flag:
             try:
-                # Capture frame - already BGR888, no conversion needed
-                frame = self.camera.capture_array("main")
+                # Capture from lores stream - same framing as main, just scaled down
+                frame = self.camera.capture_array("lores")
                 
                 if frame is None:
                     error_count += 1
@@ -396,8 +402,12 @@ class CameraController:
                     break
                 time.sleep(0.1)  # Brief pause before retry
         
+        # Properly destroy window and flush event queue
         try:
+            cv2.destroyWindow(self.PREVIEW_WINDOW)
+            cv2.waitKey(1)
             cv2.destroyAllWindows()
+            cv2.waitKey(1)
         except Exception:
             pass
     
@@ -439,11 +449,17 @@ class CameraController:
         self.stop_preview_flag = True
         
         if self.preview_thread and self.preview_thread.is_alive():
-            self.preview_thread.join(timeout=1.0)
+            self.preview_thread.join(timeout=2.0)
         
         if CV2_AVAILABLE:
             try:
+                # Destroy specific window and flush event queue
+                cv2.destroyWindow(self.PREVIEW_WINDOW)
+                cv2.waitKey(1)
                 cv2.destroyAllWindows()
+                # Multiple waitKey calls to ensure event loop processes destruction
+                for _ in range(5):
+                    cv2.waitKey(1)
             except Exception:
                 pass
         
@@ -454,6 +470,7 @@ class CameraController:
                 pass
         
         self.preview_active = False
+        self.preview_thread = None
     
     def capture(self, filepath, angle=None):
         """Capture and save a high-resolution image with angle overlay."""
@@ -466,12 +483,8 @@ class CameraController:
             # Trigger autofocus
             self.camera.set_controls({"AfTrigger": controls.AfTriggerEnum.Start})
             time.sleep(0.3)
-            # Switch to still config, capture, then back to video config
-            # This gets full resolution without permanently stopping preview
-            if hasattr(self, 'still_config') and self.still_config:
-                self.camera.switch_mode_and_capture_file(self.still_config, filepath)
-            else:
-                self.camera.capture_file(filepath)
+            # Direct capture from main stream - same config as preview, just full resolution
+            self.camera.capture_file(filepath, name="main")
             
             # Add angle overlay to saved image
             if angle is not None and CV2_AVAILABLE and os.path.exists(filepath):
@@ -589,15 +602,38 @@ class CameraController:
             return "Active"
     
     def cleanup(self):
-        """Clean up camera resources."""
+        """Clean up camera resources - must fully release for re-initialization."""
+        # Stop video recording first
+        self.stop_video_recording()
+        
+        # Stop preview and wait for thread to fully terminate
         self.stop_preview()
+        
+        # Fully release camera
         if self.camera:
             try:
                 self.camera.stop()
+            except Exception:
+                pass
+            try:
                 self.camera.close()
             except Exception:
                 pass
+            self.camera = None
+        
+        # Reset all state
         self.is_initialized = False
+        self.preview_active = False
+        self.preview_thread = None
+        self.stop_preview_flag = False
+        self.video_writer = None
+        self.video_recording = False
+        self.current_angle = 0
+        
+        # Force garbage collection to release camera resources
+        import gc
+        gc.collect()
+        time.sleep(0.5)  # Brief pause to let hardware release
 
 # =============================================================================
 # STORAGE MANAGER
