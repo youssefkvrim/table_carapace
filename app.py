@@ -273,12 +273,27 @@ class CameraController:
     
     PREVIEW_WINDOW = "Camera Preview - Press Q to close"
     
+    # Overlay settings
+    OVERLAY_FONT = cv2.FONT_HERSHEY_SIMPLEX if CV2_AVAILABLE else None
+    OVERLAY_FONT_SCALE_PREVIEW = 1.5
+    OVERLAY_FONT_SCALE_STILL = 4.0
+    OVERLAY_COLOR = (255, 255, 255)  # White
+    OVERLAY_SHADOW_COLOR = (0, 0, 0)  # Black shadow for readability
+    OVERLAY_THICKNESS_PREVIEW = 2
+    OVERLAY_THICKNESS_STILL = 8
+    
     def __init__(self):
         self.camera = None
         self.is_initialized = False
         self.preview_active = False
         self.preview_thread = None
         self.stop_preview_flag = False
+        self.still_config = None  # High-res capture configuration
+        
+        # Video recording state
+        self.video_writer = None
+        self.video_recording = False
+        self.current_angle = 0
         
         if CAMERA_AVAILABLE:
             self._initialize()
@@ -286,18 +301,27 @@ class CameraController:
     def _initialize(self):
         try:
             self.camera = Picamera2()
-            config = self.camera.create_still_configuration(
-                main={"size": CONFIG.CAMERA_RESOLUTION, "format": "RGB888"},
-                lores={"size": CONFIG.CAMERA_PREVIEW_SIZE, "format": "RGB888"},
-                buffer_count=2
+            # Use video configuration for smooth preview streaming
+            # BGR888 format matches OpenCV native format - no conversion needed
+            preview_config = self.camera.create_video_configuration(
+                main={"size": CONFIG.CAMERA_PREVIEW_SIZE, "format": "BGR888"},
+                buffer_count=4  # More buffers = smoother streaming
             )
-            self.camera.configure(config)
+            # Still configuration for high-res capture
+            self.still_config = self.camera.create_still_configuration(
+                main={"size": CONFIG.CAMERA_RESOLUTION, "format": "RGB888"},
+            )
+            self.camera.configure(preview_config)
             self.camera.set_controls({
                 "AfMode": controls.AfModeEnum.Continuous,
                 "AfSpeed": controls.AfSpeedEnum.Normal,
+                # Lock AWB after stabilization for consistent colors
+                "AwbEnable": True,
             })
             self.camera.start()
-            time.sleep(2)
+            # Wait for AWB/AEC to stabilize (critical for color consistency)
+            print("  [CAMERA] Waiting for auto-exposure to stabilize...")
+            time.sleep(3)
             self.is_initialized = True
         except Exception as e:
             print(f"  [CAMERA] Init failed: {e}")
@@ -326,24 +350,56 @@ class CameraController:
     
     def _opencv_preview_loop(self):
         """OpenCV preview loop running in separate thread."""
-        cv2.namedWindow(self.PREVIEW_WINDOW, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(self.PREVIEW_WINDOW, 800, 600)
+        try:
+            cv2.namedWindow(self.PREVIEW_WINDOW, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(self.PREVIEW_WINDOW, 800, 600)
+        except Exception as e:
+            print(f"  [CAMERA] Failed to create preview window: {e}")
+            return
+        
+        frame_count = 0
+        error_count = 0
+        max_errors = 10  # Stop after consecutive errors
         
         while not self.stop_preview_flag:
             try:
-                # Capture low-res frame for preview
-                frame = self.camera.capture_array("lores")
-                # Convert RGB to BGR for OpenCV
-                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                cv2.imshow(self.PREVIEW_WINDOW, frame_bgr)
+                # Capture frame - already BGR888, no conversion needed
+                frame = self.camera.capture_array("main")
                 
-                key = cv2.waitKey(30) & 0xFF
+                if frame is None:
+                    error_count += 1
+                    if error_count >= max_errors:
+                        print(f"\n  [CAMERA] Too many frame errors, stopping preview")
+                        break
+                    continue
+                
+                error_count = 0  # Reset on successful frame
+                frame_count += 1
+                
+                # Record frame to video if recording is active
+                if self.video_recording:
+                    self.record_frame(frame)
+                
+                # Add angle overlay to preview display
+                display_frame = self.add_angle_overlay(frame.copy(), self.current_angle, is_still=False)
+                cv2.imshow(self.PREVIEW_WINDOW, display_frame)
+                
+                # 16ms = ~60fps max, but actual fps limited by camera
+                key = cv2.waitKey(16) & 0xFF
                 if key == ord('q'):
                     break
-            except Exception:
-                break
+                    
+            except Exception as e:
+                error_count += 1
+                if error_count >= max_errors:
+                    print(f"\n  [CAMERA] Preview error: {e}")
+                    break
+                time.sleep(0.1)  # Brief pause before retry
         
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
     
     def _start_native_preview(self):
         """Start preview using Picamera2 native preview."""
@@ -399,35 +455,126 @@ class CameraController:
         
         self.preview_active = False
     
-    def capture(self, filepath):
-        """Capture and save an image."""
+    def capture(self, filepath, angle=None):
+        """Capture and save a high-resolution image with angle overlay."""
         if not CAMERA_AVAILABLE:
-            return self._mock_capture(filepath)
+            return self._mock_capture(filepath, angle)
         if not self.is_initialized:
             return False
         try:
             os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            # Trigger autofocus
             self.camera.set_controls({"AfTrigger": controls.AfTriggerEnum.Start})
             time.sleep(0.3)
-            self.camera.capture_file(filepath)
+            # Switch to still config, capture, then back to video config
+            # This gets full resolution without permanently stopping preview
+            if hasattr(self, 'still_config') and self.still_config:
+                self.camera.switch_mode_and_capture_file(self.still_config, filepath)
+            else:
+                self.camera.capture_file(filepath)
+            
+            # Add angle overlay to saved image
+            if angle is not None and CV2_AVAILABLE and os.path.exists(filepath):
+                self._add_overlay_to_file(filepath, angle)
+            
             return os.path.exists(filepath)
         except Exception as e:
             print(f"  [CAMERA] Capture error: {e}")
             return False
     
-    def _mock_capture(self, filepath):
+    def _add_overlay_to_file(self, filepath, angle):
+        """Add angle overlay to an existing image file."""
+        try:
+            img = cv2.imread(filepath)
+            if img is not None:
+                img = self.add_angle_overlay(img, angle, is_still=True)
+                cv2.imwrite(filepath, img, [cv2.IMWRITE_JPEG_QUALITY, CONFIG.CAMERA_QUALITY])
+        except Exception as e:
+            print(f"  [CAMERA] Overlay error: {e}")
+    
+    def _mock_capture(self, filepath, angle=None):
         """Create mock image for testing without camera."""
         try:
             os.makedirs(os.path.dirname(filepath), exist_ok=True)
             if PIL_AVAILABLE:
                 img = Image.new('RGB', (640, 480), color='white')
                 img.save(filepath, 'JPEG', quality=CONFIG.CAMERA_QUALITY)
+                # Add overlay if angle provided and OpenCV available
+                if angle is not None and CV2_AVAILABLE:
+                    self._add_overlay_to_file(filepath, angle)
             else:
                 with open(filepath, 'w') as f:
                     f.write("MOCK")
             return True
         except Exception:
             return False
+    
+    def set_current_angle(self, angle):
+        """Set current angle for video overlay."""
+        self.current_angle = angle
+    
+    def add_angle_overlay(self, frame, angle, is_still=False):
+        """Add angle text overlay to top-right corner of frame."""
+        if not CV2_AVAILABLE or frame is None:
+            return frame
+        
+        text = f"{int(angle):03d} deg"
+        font_scale = self.OVERLAY_FONT_SCALE_STILL if is_still else self.OVERLAY_FONT_SCALE_PREVIEW
+        thickness = self.OVERLAY_THICKNESS_STILL if is_still else self.OVERLAY_THICKNESS_PREVIEW
+        
+        # Get text size to position in top-right
+        (text_w, text_h), baseline = cv2.getTextSize(text, self.OVERLAY_FONT, font_scale, thickness)
+        
+        # Position: top-right with padding
+        padding = 20 if not is_still else 60
+        x = frame.shape[1] - text_w - padding
+        y = text_h + padding
+        
+        # Draw shadow for readability
+        cv2.putText(frame, text, (x + 2, y + 2), self.OVERLAY_FONT, font_scale, 
+                    self.OVERLAY_SHADOW_COLOR, thickness + 2, cv2.LINE_AA)
+        # Draw main text
+        cv2.putText(frame, text, (x, y), self.OVERLAY_FONT, font_scale,
+                    self.OVERLAY_COLOR, thickness, cv2.LINE_AA)
+        
+        return frame
+    
+    def start_video_recording(self, filepath):
+        """Start recording video to file."""
+        if not CV2_AVAILABLE:
+            return False
+        try:
+            # Use H264 codec with mp4 container
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            fps = 20  # Target framerate
+            frame_size = CONFIG.CAMERA_PREVIEW_SIZE
+            self.video_writer = cv2.VideoWriter(filepath, fourcc, fps, frame_size)
+            self.video_recording = True
+            return True
+        except Exception as e:
+            print(f"  [VIDEO] Failed to start recording: {e}")
+            return False
+    
+    def record_frame(self, frame):
+        """Record a single frame with angle overlay to video."""
+        if not self.video_recording or self.video_writer is None:
+            return
+        try:
+            # Add angle overlay
+            frame_with_overlay = self.add_angle_overlay(frame.copy(), self.current_angle, is_still=False)
+            self.video_writer.write(frame_with_overlay)
+        except Exception:
+            pass
+    
+    def stop_video_recording(self):
+        """Stop video recording and release writer."""
+        self.video_recording = False
+        if self.video_writer is not None:
+            try:
+                self.video_writer.release()
+            except Exception:
+                pass
+            self.video_writer = None
     
     def get_status(self):
         """Get current camera status info."""
@@ -473,6 +620,13 @@ class StorageManager:
         if not self.current_piece_id:
             raise ValueError("Piece ID not set")
         filename = f"{CONFIG.FILE_PREFIX}_{self.current_piece_id}_{int(angle):03d}deg.{CONFIG.FILE_EXTENSION}"
+        return os.path.join(self.current_folder, filename)
+    
+    def get_video_filepath(self):
+        """Get filepath for scan video."""
+        if not self.current_piece_id:
+            raise ValueError("Piece ID not set")
+        filename = f"{CONFIG.FILE_PREFIX}_{self.current_piece_id}_scan.mp4"
         return os.path.join(self.current_folder, filename)
     
     def get_image_count(self):
@@ -582,15 +736,27 @@ class Application:
         else:
             print("  [PREVIEW] Running without preview window")
         
+        # Start video recording
+        video_path = self.storage.get_video_filepath()
+        video_ok = self.camera.start_video_recording(video_path)
+        if video_ok:
+            print(f"  [VIDEO] Recording to: {os.path.basename(video_path)}")
+        else:
+            print("  [VIDEO] Video recording not available")
+        
         print(f"\n  Starting scan... Press Ctrl+C to abort.\n")
         
         self.motor.enable()
         self.motor.reset_position()
+        self.camera.set_current_angle(0)  # Initialize angle for overlay
         
         captured = 0
         try:
             for i in range(CONFIG.TOTAL_PHOTOS):
                 current_angle = i * CONFIG.ROTATION_INCREMENT
+                
+                # Update angle for video overlay
+                self.camera.set_current_angle(current_angle)
                 
                 # Status update
                 status = self.camera.get_status()
@@ -598,9 +764,9 @@ class Application:
                 
                 time.sleep(CONFIG.CAPTURE_DELAY)
                 
-                # Capture and save
+                # Capture and save with angle overlay
                 filepath = self.storage.get_filepath(current_angle)
-                success = self.camera.capture(filepath)
+                success = self.camera.capture(filepath, angle=current_angle)
                 
                 if success:
                     captured += 1
@@ -619,6 +785,7 @@ class Application:
             print("\n\n  Scan aborted by user.")
         
         finally:
+            self.camera.stop_video_recording()
             self.camera.stop_preview()
             self.motor.disable()
             self.motor.cleanup()
@@ -626,6 +793,9 @@ class Application:
         
         print("\n" + "=" * 100)
         print(f"  SCAN COMPLETE: {captured}/{CONFIG.TOTAL_PHOTOS} images")
+        if video_ok and os.path.exists(video_path):
+            video_size = os.path.getsize(video_path) / (1024 * 1024)
+            print(f"  VIDEO: {os.path.basename(video_path)} ({video_size:.1f}MB)")
         print(f"  Location: {self.storage.current_folder}")
         print("=" * 100)
         
