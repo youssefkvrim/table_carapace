@@ -8,8 +8,39 @@ import os
 import sys
 import time
 import json
+import gc
 import threading
+import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
+
+# =============================================================================
+# LOGGING SETUP
+# =============================================================================
+LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "app.log")
+
+# Configure rotating file handler (5MB max, keep 3 backups)
+_file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5*1024*1024, backupCount=3)
+_file_handler.setFormatter(logging.Formatter(
+    '%(asctime)s | %(levelname)-8s | %(name)-12s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+))
+
+# Configure console handler (errors only to avoid cluttering UI)
+_console_handler = logging.StreamHandler()
+_console_handler.setLevel(logging.ERROR)
+_console_handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+
+# Root logger
+logging.basicConfig(level=logging.DEBUG, handlers=[_file_handler, _console_handler])
+
+# Module loggers
+log_main = logging.getLogger("main")
+log_motor = logging.getLogger("motor")
+log_camera = logging.getLogger("camera")
+log_storage = logging.getLogger("storage")
 
 # =============================================================================
 # CONFIGURATION
@@ -23,11 +54,16 @@ class Config:
     # MOTOR SETTINGS
     STEPS_PER_REVOLUTION = 800
     DEGREES_PER_STEP = 360.0 / 800
-    ROTATION_INCREMENT = 15  # degrees per photo
+    ROTATION_INCREMENT = 15  # degrees per photo (must be 5-90 and divide 360 evenly)
     TOTAL_PHOTOS = 360 // 15  # 24 photos
-    PULSE_DELAY_US = 500
-    STEP_DELAY_MS = 5
+    # Note: Python time.sleep() has ~1ms granularity on Linux; values below 1ms are approximate
+    PULSE_DELAY_MS = 0.5      # delay for each pulse edge (minimum reliable: ~0.5ms)
+    STEP_DELAY_MS = 5         # delay between steps
     CALIBRATION_FACTOR = 1.0
+    
+    # VIDEO SETTINGS
+    VIDEO_CODEC = "mp4v"      # Options: "mp4v" (compatible), "avc1" (H.264, smaller), "XVID", "MJPG"
+    VIDEO_FPS = 15            # Frames per second for scan video
     
     # CAMERA SETTINGS
     CAMERA_RESOLUTION = (4608, 2592)
@@ -200,9 +236,11 @@ class MotorController:
         
         # Initialize GPIO pins using gpiozero OutputDevice
         # initial_value=False means pin starts LOW, True means HIGH
+        log_motor.info(f"Initializing motor controller (GPIO: PUL={CONFIG.GPIO_PULSE}, DIR={CONFIG.GPIO_DIRECTION}, ENA={CONFIG.GPIO_ENABLE})")
         self.pulse_pin = OutputDevice(CONFIG.GPIO_PULSE, initial_value=False)
         self.direction_pin = OutputDevice(CONFIG.GPIO_DIRECTION, initial_value=False)
         self.enable_pin = OutputDevice(CONFIG.GPIO_ENABLE, initial_value=True)  # HIGH = disabled
+        log_motor.info("Motor controller initialized")
     
     def enable(self):
         """Enable motor driver (ENA is active LOW on DM556)."""
@@ -215,17 +253,24 @@ class MotorController:
         self.enable_pin.on()  # HIGH = disabled
         self.is_enabled = False
     
-    def step(self, num_steps, delay_us=None):
-        """Execute step pulses."""
-        if delay_us is None:
-            delay_us = CONFIG.PULSE_DELAY_US
-        delay_s = delay_us / 1_000_000
+    def step(self, num_steps, delay_ms=None):
+        """Execute step pulses.
+        
+        Args:
+            num_steps: Number of step pulses to execute
+            delay_ms: Pulse edge delay in milliseconds (default: CONFIG.PULSE_DELAY_MS)
+                      Note: Python sleep has ~1ms granularity; sub-ms values are approximate
+        """
+        if delay_ms is None:
+            delay_ms = CONFIG.PULSE_DELAY_MS
+        delay_s = delay_ms / 1000.0
+        step_delay_s = CONFIG.STEP_DELAY_MS / 1000.0
         for _ in range(num_steps):
             self.pulse_pin.on()
             time.sleep(delay_s)
             self.pulse_pin.off()
             time.sleep(delay_s)
-            time.sleep(CONFIG.STEP_DELAY_MS / 1000)
+            time.sleep(step_delay_s)
     
     def rotate_degrees(self, degrees, clockwise=True):
         """Rotate motor by specified degrees."""
@@ -288,6 +333,7 @@ class CameraController:
         self.preview_active = False
         self.preview_thread = None
         self.stop_preview_flag = False
+        self._cleanup_lock = threading.Lock()  # Prevent concurrent cleanup/init
         
         # Video recording state
         self.video_writer = None
@@ -300,14 +346,16 @@ class CameraController:
     
     def _initialize(self):
         try:
+            log_camera.info("Initializing Picamera2")
             self.camera = Picamera2()
             # Single configuration with both streams from SAME sensor mode:
             # - main: full resolution for capture (what you save)
             # - lores: scaled down for preview (exact same framing/colors)
-            # Using BGR888 for both since OpenCV expects BGR
+            # Using RGB888 format - Picamera2 outputs RGB regardless of BGR888 setting
+            # OpenCV conversion to BGR is done in preview loop
             config = self.camera.create_still_configuration(
-                main={"size": CONFIG.CAMERA_RESOLUTION, "format": "BGR888"},
-                lores={"size": CONFIG.CAMERA_PREVIEW_SIZE, "format": "BGR888"},
+                main={"size": CONFIG.CAMERA_RESOLUTION, "format": "RGB888"},
+                lores={"size": CONFIG.CAMERA_PREVIEW_SIZE, "format": "RGB888"},
                 buffer_count=4,
                 queue=True,  # Enable frame queueing for smoother preview
             )
@@ -322,7 +370,9 @@ class CameraController:
             print("  [CAMERA] Waiting for auto-exposure to stabilize...")
             time.sleep(2)
             self.is_initialized = True
+            log_camera.info(f"Camera initialized (resolution={CONFIG.CAMERA_RESOLUTION}, preview={CONFIG.CAMERA_PREVIEW_SIZE})")
         except Exception as e:
+            log_camera.exception(f"Camera initialization failed: {e}")
             print(f"  [CAMERA] Init failed: {e}")
             self.camera = None
     
@@ -375,12 +425,14 @@ class CameraController:
                 
                 if frame is None:
                     error_count += 1
+                    log_camera.warning(f"Frame capture returned None (error {error_count}/{max_errors})")
                     if error_count >= max_errors:
+                        log_camera.error("Too many frame errors, stopping preview")
                         print(f"\n  [CAMERA] Too many frame errors, stopping preview")
                         break
                     continue
                 
-                # Picamera2 lores often outputs RGB despite BGR888 setting - convert to BGR for OpenCV
+                # Convert RGB (Picamera2 native) to BGR (OpenCV native)
                 frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                 
                 error_count = 0  # Reset on successful frame
@@ -481,6 +533,7 @@ class CameraController:
         if not CAMERA_AVAILABLE:
             return self._mock_capture(filepath, angle)
         if not self.is_initialized:
+            log_camera.error("Capture attempted but camera not initialized")
             return False
         try:
             os.makedirs(os.path.dirname(filepath), exist_ok=True)
@@ -494,8 +547,14 @@ class CameraController:
             if angle is not None and CV2_AVAILABLE and os.path.exists(filepath):
                 self._add_overlay_to_file(filepath, angle)
             
-            return os.path.exists(filepath)
+            if os.path.exists(filepath):
+                size_kb = os.path.getsize(filepath) / 1024
+                log_camera.debug(f"Captured: {os.path.basename(filepath)} ({size_kb:.0f}KB)")
+                return True
+            log_camera.error(f"Capture file not created: {filepath}")
+            return False
         except Exception as e:
+            log_camera.exception(f"Capture error: {e}")
             print(f"  [CAMERA] Capture error: {e}")
             return False
     
@@ -557,14 +616,24 @@ class CameraController:
         return frame
     
     def start_video_recording(self, filepath):
-        """Start recording video to file."""
+        """Start recording video to file.
+        
+        Video is recorded at preview resolution (CONFIG.CAMERA_PREVIEW_SIZE) for performance.
+        Full resolution stills are captured separately during the scan.
+        
+        Codec priority: CONFIG.VIDEO_CODEC first, then fallbacks for compatibility.
+        """
         if not CV2_AVAILABLE:
+            log_camera.warning("OpenCV not available, video recording disabled")
             return False
         try:
-            # Try multiple codecs - mp4v is most compatible
-            codecs = ['mp4v', 'avc1', 'XVID', 'MJPG']
-            fps = 15  # Lower fps for reliability
-            # VideoWriter expects (width, height)
+            # Try configured codec first, then fallbacks
+            preferred = CONFIG.VIDEO_CODEC
+            fallbacks = ['mp4v', 'avc1', 'XVID', 'MJPG']
+            codecs = [preferred] + [c for c in fallbacks if c != preferred]
+            
+            fps = CONFIG.VIDEO_FPS
+            # Video recorded at preview resolution for performance (not capture resolution)
             frame_size = (CONFIG.CAMERA_PREVIEW_SIZE[0], CONFIG.CAMERA_PREVIEW_SIZE[1])
             
             for codec in codecs:
@@ -573,14 +642,18 @@ class CameraController:
                 if self.video_writer.isOpened():
                     self.video_recording = True
                     self.video_frame_count = 0
-                    print(f"  [VIDEO] Using codec: {codec}")
+                    log_camera.info(f"Video recording started: {filepath} (codec={codec}, {frame_size[0]}x{frame_size[1]}@{fps}fps)")
+                    print(f"  [VIDEO] Recording at {frame_size[0]}x{frame_size[1]} using codec: {codec}")
                     return True
                 self.video_writer.release()
+                log_camera.debug(f"Codec {codec} failed, trying next")
             
+            log_camera.error("No compatible video codec found")
             print("  [VIDEO] No compatible codec found")
             self.video_writer = None
             return False
         except Exception as e:
+            log_camera.exception(f"Failed to start video recording: {e}")
             print(f"  [VIDEO] Failed to start recording: {e}")
             return False
     
@@ -631,39 +704,57 @@ class CameraController:
             return "Active"
     
     def cleanup(self):
-        """Clean up camera resources - must fully release for re-initialization."""
-        # Stop video recording first
-        self.stop_video_recording()
+        """Clean up camera resources - must fully release for re-initialization.
         
-        # Stop preview and wait for thread to fully terminate
-        self.stop_preview()
-        
-        # Fully release camera
-        if self.camera:
-            try:
-                self.camera.stop()
-            except Exception:
-                pass
-            try:
-                self.camera.close()
-            except Exception:
-                pass
-            self.camera = None
-        
-        # Reset all state
-        self.is_initialized = False
-        self.preview_active = False
-        self.preview_thread = None
-        self.stop_preview_flag = False
-        self.video_writer = None
-        self.video_recording = False
-        self.video_frame_count = 0
-        self.current_angle = 0
-        
-        # Force garbage collection to release camera resources
-        import gc
-        gc.collect()
-        time.sleep(0.5)  # Brief pause to let hardware release
+        Thread-safe cleanup with lock to prevent race conditions during
+        concurrent cleanup/initialization attempts.
+        """
+        with self._cleanup_lock:
+            log_camera.info("Starting camera cleanup")
+            
+            # Stop video recording first
+            self.stop_video_recording()
+            
+            # Stop preview and wait for thread to fully terminate
+            self.stop_preview()
+            
+            # Wait for preview thread to fully terminate
+            if self.preview_thread is not None:
+                self.preview_thread.join(timeout=3.0)
+                if self.preview_thread.is_alive():
+                    log_camera.warning("Preview thread did not terminate cleanly")
+            
+            # Fully release camera with explicit stop -> close sequence
+            if self.camera:
+                try:
+                    self.camera.stop()
+                    log_camera.debug("Camera stopped")
+                except Exception as e:
+                    log_camera.debug(f"Camera stop exception (may be expected): {e}")
+                try:
+                    self.camera.close()
+                    log_camera.debug("Camera closed")
+                except Exception as e:
+                    log_camera.debug(f"Camera close exception (may be expected): {e}")
+                self.camera = None
+            
+            # Reset all state
+            self.is_initialized = False
+            self.preview_active = False
+            self.preview_thread = None
+            self.stop_preview_flag = False
+            self.video_writer = None
+            self.video_recording = False
+            self.video_frame_count = 0
+            self.current_angle = 0
+            
+            # Force garbage collection to release camera hardware resources
+            gc.collect()
+            
+            # Allow hardware to fully release before potential re-init
+            # This delay is necessary for libcamera to release /dev/video* handles
+            time.sleep(0.3)
+            log_camera.info("Camera cleanup complete")
 
 # =============================================================================
 # STORAGE MANAGER
@@ -680,6 +771,7 @@ class StorageManager:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.current_folder = os.path.join(self.local_path, f"{self.current_piece_id}_{timestamp}")
         os.makedirs(self.current_folder, exist_ok=True)
+        log_storage.info(f"New scan: piece_id={self.current_piece_id}, folder={self.current_folder}")
         return self.current_piece_id
     
     def get_filepath(self, angle):
@@ -859,9 +951,11 @@ class Application:
         
         print("\n" + "=" * 100)
         print(f"  SCAN COMPLETE: {captured}/{CONFIG.TOTAL_PHOTOS} images")
+        log_main.info(f"Scan complete: {captured}/{CONFIG.TOTAL_PHOTOS} images for piece {piece_id}")
         if video_ok and os.path.exists(video_path):
             video_size = os.path.getsize(video_path) / (1024 * 1024)
             print(f"  VIDEO: {os.path.basename(video_path)} ({video_size:.1f}MB)")
+            log_main.info(f"Video saved: {video_path} ({video_size:.1f}MB)")
         print(f"  Location: {self.storage.current_folder}")
         print("=" * 100)
         
@@ -931,7 +1025,7 @@ class Application:
             print("                                MOTOR TEST & CALIBRATION")
             print("=" * 100)
             print(f"\n  Current: Increment={CONFIG.ROTATION_INCREMENT}deg | Calibration={CONFIG.CALIBRATION_FACTOR:.6f}")
-            print(f"  Speed: Pulse={CONFIG.PULSE_DELAY_US}us | Step={CONFIG.STEP_DELAY_MS}ms")
+            print(f"  Speed: Pulse={CONFIG.PULSE_DELAY_MS}ms | Step={CONFIG.STEP_DELAY_MS}ms")
             print("\n" + "-" * 100)
             print("\n    [1] ROTATE BY DEGREES     Enter custom rotation angle")
             print(f"    [2] MODIFY INCREMENT      Change rotation increment (current: {CONFIG.ROTATION_INCREMENT})")
@@ -1003,19 +1097,29 @@ class Application:
         print(f"\n  Current increment: {CONFIG.ROTATION_INCREMENT} degrees")
         print(f"  Total photos per scan: {CONFIG.TOTAL_PHOTOS}")
         
+        # Valid increments: divide 360 evenly and result in 4-72 photos (5-90 degrees)
+        valid_increments = [i for i in range(5, 91) if 360 % i == 0]
+        print(f"\n  Valid increments: {valid_increments}")
+        
         try:
             new_val = input("\n  Enter new increment (degrees): ").strip()
             if new_val:
                 new_increment = int(new_val)
-                if 360 % new_increment == 0 and new_increment > 0:
+                if new_increment in valid_increments:
                     CONFIG.ROTATION_INCREMENT = new_increment
                     CONFIG.TOTAL_PHOTOS = 360 // new_increment
+                    log_main.info(f"Rotation increment changed to {new_increment}deg ({CONFIG.TOTAL_PHOTOS} photos)")
                     print(f"\n  Increment set to {new_increment} degrees")
                     print(f"  Total photos per scan: {CONFIG.TOTAL_PHOTOS}")
+                elif 360 % new_increment == 0:
+                    photos = 360 // new_increment
+                    print(f"  Increment {new_increment} would result in {photos} photos.")
+                    print(f"  Allowed range: 5-90 degrees (4-72 photos).")
                 else:
-                    print("  Increment must divide 360 evenly.")
+                    print(f"  Increment {new_increment} does not divide 360 evenly.")
+                    print(f"  Valid options: {valid_increments}")
         except ValueError:
-            print("  Invalid input.")
+            print("  Invalid input. Enter a number.")
         
         input("\n  Press ENTER to continue...")
     
@@ -1025,24 +1129,27 @@ class Application:
         print("\n" + "=" * 100)
         print("                                  MODIFY MOTOR SPEED")
         print("=" * 100)
-        print(f"\n  Current pulse delay: {CONFIG.PULSE_DELAY_US} microseconds")
-        print(f"  Current step delay: {CONFIG.STEP_DELAY_MS} milliseconds")
-        print("\n  Lower pulse delay = faster rotation (min recommended: 100us)")
+        print(f"\n  Current pulse delay: {CONFIG.PULSE_DELAY_MS} ms")
+        print(f"  Current step delay: {CONFIG.STEP_DELAY_MS} ms")
+        print("\n  Lower delays = faster rotation")
+        print("  Note: Python timing has ~1ms granularity; values < 0.5ms are unreliable")
         
         try:
-            pulse_input = input(f"\n  Pulse delay [100-5000] ({CONFIG.PULSE_DELAY_US}): ").strip()
+            pulse_input = input(f"\n  Pulse delay in ms [0.5-10] ({CONFIG.PULSE_DELAY_MS}): ").strip()
             if pulse_input:
-                pulse = int(pulse_input)
-                CONFIG.PULSE_DELAY_US = max(100, min(5000, pulse))
-                print(f"  Pulse delay set to {CONFIG.PULSE_DELAY_US} microseconds")
+                pulse = float(pulse_input)
+                CONFIG.PULSE_DELAY_MS = max(0.5, min(10, pulse))
+                log_main.info(f"Pulse delay changed to {CONFIG.PULSE_DELAY_MS}ms")
+                print(f"  Pulse delay set to {CONFIG.PULSE_DELAY_MS} ms")
             
-            step_input = input(f"  Step delay [1-50] ({CONFIG.STEP_DELAY_MS}): ").strip()
+            step_input = input(f"  Step delay in ms [1-50] ({CONFIG.STEP_DELAY_MS}): ").strip()
             if step_input:
-                step = int(step_input)
+                step = float(step_input)
                 CONFIG.STEP_DELAY_MS = max(1, min(50, step))
-                print(f"  Step delay set to {CONFIG.STEP_DELAY_MS} milliseconds")
+                log_main.info(f"Step delay changed to {CONFIG.STEP_DELAY_MS}ms")
+                print(f"  Step delay set to {CONFIG.STEP_DELAY_MS} ms")
         except ValueError:
-            print("  Invalid input.")
+            print("  Invalid input. Enter a number.")
         
         input("\n  Press ENTER to continue...")
     
@@ -1053,8 +1160,10 @@ class Application:
         print("                                  MOTOR CALIBRATION")
         print("=" * 100)
         print(f"\n  Current calibration factor: {CONFIG.CALIBRATION_FACTOR:.6f}")
-        print("\n  Factor > 1.0 = motor rotates less than expected")
-        print("  Factor < 1.0 = motor rotates more than expected")
+        print("\n  How calibration works:")
+        print("    - If motor rotates LESS than commanded: INCREASE factor (e.g., 1.02)")
+        print("    - If motor rotates MORE than commanded: DECREASE factor (e.g., 0.98)")
+        print("    - Factor of 1.0 = no correction applied")
         print("\n" + "-" * 100)
         print("\n    [1] Test 360 rotation (measure actual)")
         print("    [2] Enter calibration factor manually")
@@ -1181,13 +1290,20 @@ class Application:
 # ENTRY POINT
 # =============================================================================
 def main():
+    log_main.info("="*60)
+    log_main.info("Table Controle Carapace - Application Starting")
+    log_main.info(f"GPIO available: {GPIO_AVAILABLE}, Camera available: {CAMERA_AVAILABLE}")
+    log_main.info("="*60)
     try:
         app = Application()
         app.run()
+        log_main.info("Application exited normally")
     except KeyboardInterrupt:
+        log_main.info("Application terminated by user (Ctrl+C)")
         print("\n\n  Program terminated.")
         sys.exit(0)
     except Exception as e:
+        log_main.exception(f"Fatal error: {e}")
         print(f"\n  Fatal error: {e}")
         sys.exit(1)
 
