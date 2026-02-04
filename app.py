@@ -325,11 +325,15 @@ class MotorController:
 # USB CAMERA CONTROLLER (Logitech BRIO / UVC cameras)
 # =============================================================================
 class USBCameraController:
-    """Controller for USB webcams (Logitech BRIO, etc.) via OpenCV."""
+    """Controller for USB webcams (Logitech BRIO, etc.) via OpenCV.
+    
+    NOTE: Preview is disabled by default when running alongside Picamera2
+    to avoid Qt/threading conflicts that cause segmentation faults.
+    """
     
     PREVIEW_WINDOW = "USB Camera Preview - Press Q to close"
     
-    def __init__(self, camera_index=None):
+    def __init__(self, camera_index=None, enable_preview=True):
         self.camera = None
         self.camera_index = camera_index
         self.is_initialized = False
@@ -337,6 +341,9 @@ class USBCameraController:
         self.preview_thread = None
         self.stop_preview_flag = False
         self._cleanup_lock = threading.Lock()
+        self._preview_enabled = enable_preview  # Can disable to avoid Qt conflicts
+        self._capture_thread = None
+        self._stop_capture_flag = False
         
         # Video recording state
         self.video_writer = None
@@ -344,6 +351,7 @@ class USBCameraController:
         self.video_frame_count = 0
         self.current_angle = 0
         self.last_frame = None  # Store last frame for capture
+        self._frame_lock = threading.Lock()
         
         if CV2_AVAILABLE and CONFIG.USB_CAMERA_ENABLED:
             self._initialize()
@@ -410,18 +418,56 @@ class USBCameraController:
             self.camera = None
     
     def start_preview(self):
-        """Start live preview in separate thread."""
+        """Start live preview or background capture thread.
+        
+        If _preview_enabled is False, starts a background capture thread
+        instead of showing a preview window (avoids Qt conflicts with Picamera2).
+        """
         if not self.is_initialized:
             return False
         
         self.stop_preview_flag = False
-        self.preview_thread = threading.Thread(target=self._preview_loop, daemon=True)
-        self.preview_thread.start()
-        self.preview_active = True
-        return True
+        self._stop_capture_flag = False
+        
+        if self._preview_enabled:
+            # Full preview with window (only use when USB camera is alone)
+            self.preview_thread = threading.Thread(target=self._preview_loop, daemon=True)
+            self.preview_thread.start()
+            self.preview_active = True
+            return True
+        else:
+            # Background capture only (no window - safe with Picamera2)
+            self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+            self._capture_thread.start()
+            self.preview_active = True  # Indicates capture is active
+            log_camera.info("USB camera running in background capture mode (no preview)")
+            return True
+    
+    def _capture_loop(self):
+        """Background capture loop without preview window."""
+        while not self._stop_capture_flag:
+            try:
+                ret, frame = self.camera.read()
+                if not ret or frame is None:
+                    time.sleep(0.01)
+                    continue
+                
+                with self._frame_lock:
+                    self.last_frame = frame.copy()
+                
+                # Record if active
+                if self.video_recording and self.video_writer:
+                    self.video_writer.write(frame)
+                    self.video_frame_count += 1
+                
+                time.sleep(0.033)  # ~30fps capture rate
+                    
+            except Exception as e:
+                log_camera.error(f"USB capture error: {e}")
+                break
     
     def _preview_loop(self):
-        """Preview loop for USB camera."""
+        """Preview loop for USB camera with window."""
         try:
             cv2.namedWindow(self.PREVIEW_WINDOW, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(self.PREVIEW_WINDOW, 640, 480)
@@ -436,7 +482,8 @@ class USBCameraController:
                     time.sleep(0.01)
                     continue
                 
-                self.last_frame = frame.copy()
+                with self._frame_lock:
+                    self.last_frame = frame.copy()
                 
                 # Record if active
                 if self.video_recording and self.video_writer:
@@ -461,11 +508,18 @@ class USBCameraController:
             pass
     
     def stop_preview(self):
-        """Stop preview."""
+        """Stop preview or background capture."""
         self.stop_preview_flag = True
+        self._stop_capture_flag = True
+        
         if self.preview_thread and self.preview_thread.is_alive():
             self.preview_thread.join(timeout=2.0)
+        if self._capture_thread and self._capture_thread.is_alive():
+            self._capture_thread.join(timeout=2.0)
+        
         self.preview_active = False
+        self.preview_thread = None
+        self._capture_thread = None
     
     def capture(self, filepath, angle=None):
         """Capture and save image."""
@@ -474,12 +528,17 @@ class USBCameraController:
         try:
             os.makedirs(os.path.dirname(filepath), exist_ok=True)
             
-            # Use last preview frame or capture new one
-            if self.last_frame is not None:
-                frame = self.last_frame.copy()
-            else:
+            # Use last captured frame or grab new one
+            frame = None
+            with self._frame_lock:
+                if self.last_frame is not None:
+                    frame = self.last_frame.copy()
+            
+            if frame is None:
+                # Try direct capture
                 ret, frame = self.camera.read()
-                if not ret:
+                if not ret or frame is None:
+                    log_camera.error("USB camera: failed to capture frame")
                     return False
             
             # Save image
@@ -529,14 +588,22 @@ class USBCameraController:
         with self._cleanup_lock:
             log_camera.info("Cleaning up USB camera")
             self.stop_video_recording()
-            self.stop_preview()
+            self.stop_preview()  # This also stops _capture_thread
+            
             if self.camera:
-                self.camera.release()
+                try:
+                    self.camera.release()
+                except:
+                    pass
                 self.camera = None
+            
             self.is_initialized = False
-            self.last_frame = None
+            with self._frame_lock:
+                self.last_frame = None
+            
             gc.collect()
             time.sleep(0.2)
+            log_camera.info("USB camera cleanup complete")
 
 
 # =============================================================================
@@ -1020,7 +1087,12 @@ CameraController = PiCameraController
 # DUAL CAMERA MANAGER
 # =============================================================================
 class DualCameraManager:
-    """Manages both Pi Camera and USB camera simultaneously."""
+    """Manages both Pi Camera and USB camera simultaneously.
+    
+    IMPORTANT: When both cameras are active, USB camera runs in background
+    capture mode (no preview window) to avoid Qt/threading conflicts with
+    Picamera2. Only Pi Camera preview is shown.
+    """
     
     def __init__(self):
         self.pi_camera = None
@@ -1036,12 +1108,16 @@ class DualCameraManager:
                 log_camera.warning("Pi camera initialization failed")
                 self.pi_camera = None
         
-        # Initialize USB Camera
+        # Initialize USB Camera - DISABLE preview if Pi camera is active to avoid Qt conflicts
         if CV2_AVAILABLE and CONFIG.USB_CAMERA_ENABLED:
-            self.usb_camera = USBCameraController()
+            # When Pi camera is active, USB runs without preview to avoid segfaults
+            usb_preview_enabled = (self.pi_camera is None)
+            self.usb_camera = USBCameraController(enable_preview=usb_preview_enabled)
             if not self.usb_camera.is_initialized:
                 log_camera.warning("USB camera initialization failed")
                 self.usb_camera = None
+            elif not usb_preview_enabled:
+                log_camera.info("USB camera preview disabled (running alongside Pi camera)")
         
         self.is_initialized = (self.pi_camera is not None) or (self.usb_camera is not None)
         
@@ -1050,7 +1126,7 @@ class DualCameraManager:
             if self.pi_camera:
                 cams.append("Pi Camera V3")
             if self.usb_camera:
-                cams.append("USB Camera")
+                cams.append("USB Camera (background)")
             log_camera.info(f"DualCameraManager ready with: {', '.join(cams)}")
     
     def start_preview(self):
@@ -1265,6 +1341,12 @@ class CameraSettingsController:
             if key == 'focus':
                 if self.af_mode != 'manual':
                     self.set_af_mode('manual')
+                    time.sleep(0.1)  # Give AF mode time to switch
+                # LensPosition is set separately after AfMode is Manual
+                self.pi_camera.camera.set_controls({"LensPosition": value})
+                self.current_values[key] = value
+                log_camera.info(f"Set focus (LensPosition) to {value}")
+                return True
             
             self.pi_camera.camera.set_controls({ctrl['control']: value})
             self.current_values[key] = value
@@ -1272,6 +1354,7 @@ class CameraSettingsController:
             return True
         except Exception as e:
             log_camera.error(f"Failed to set {key}: {e}")
+            print(f"  Error setting {key}: {e}")
             return False
     
     def get_control(self, key):
@@ -1618,11 +1701,13 @@ class Application:
             self.camera = PiCameraController()
             cam_name = "Pi Camera"
         elif cam_choice == "2":
-            self.camera = USBCameraController()
+            # USB camera alone - preview enabled
+            self.camera = USBCameraController(enable_preview=True)
             cam_name = "USB Camera"
         elif cam_choice == "3":
+            # Dual mode - only Pi preview, USB runs in background
             self.camera = DualCameraManager()
-            cam_name = "Dual Cameras"
+            cam_name = "Dual Cameras (Pi preview only)"
         else:
             print("  Invalid option.")
             time.sleep(1)
@@ -1670,7 +1755,12 @@ class Application:
             pass
         
         print("\n\n  Stopping preview...")
-        self.camera.cleanup()
+        if self.camera:
+            self.camera.stop_preview()
+            time.sleep(0.3)
+            self.camera.cleanup()
+            self.camera = None
+        gc.collect()
         
         input("\n  Press ENTER to continue...")
     
@@ -1763,7 +1853,13 @@ class Application:
                         print("  Invalid value.")
         
         print("\n  Closing camera...")
+        # Stop preview first, then cleanup
+        self.camera.stop_preview()
+        time.sleep(0.5)  # Allow Qt to process events
         self.camera.cleanup()
+        self.camera = None
+        gc.collect()
+        print("  Camera closed.")
         input("\n  Press ENTER to continue...")
     
     def test_motor_menu(self):
