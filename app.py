@@ -357,56 +357,116 @@ class USBCameraController:
             self._initialize()
     
     def _find_usb_camera(self):
-        """Find USB camera index by scanning available devices."""
+        """Find USB camera by scanning /dev/video* for UVC devices."""
+        import subprocess
+        
         # Try the configured index first
         if self.camera_index is not None:
-            cap = cv2.VideoCapture(self.camera_index)
+            cap = cv2.VideoCapture(self.camera_index, cv2.CAP_V4L2)
             if cap.isOpened():
+                ret, _ = cap.read()
                 cap.release()
-                return self.camera_index
+                if ret:
+                    log_camera.info(f"Using configured USB camera index: {self.camera_index}")
+                    return self.camera_index
         
-        # Scan for USB cameras (typically higher indices than CSI)
-        # On Pi with CSI camera, USB cameras often start at index 2 or higher
-        for idx in [0, 1, 2, 3, 4, 8, 10]:
-            cap = cv2.VideoCapture(idx)
+        # Find USB camera by querying v4l2 devices
+        # Look for UVC devices (Logitech BRIO, etc.) vs Pi camera (rp1-cfe)
+        usb_devices = []
+        try:
+            # List all video devices
+            result = subprocess.run(['v4l2-ctl', '--list-devices'], 
+                                   capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                lines = result.stdout.split('\n')
+                current_device = None
+                for line in lines:
+                    if line and not line.startswith('\t') and not line.startswith(' '):
+                        current_device = line.strip()
+                    elif line.strip().startswith('/dev/video'):
+                        dev = line.strip()
+                        # Skip rp1-cfe devices (Pi camera)
+                        if current_device and 'rp1' not in current_device.lower():
+                            # Extract index from /dev/videoN
+                            try:
+                                idx = int(dev.replace('/dev/video', ''))
+                                usb_devices.append((idx, current_device, dev))
+                                log_camera.debug(f"Found USB camera: {current_device} at {dev}")
+                            except ValueError:
+                                pass
+        except Exception as e:
+            log_camera.debug(f"v4l2-ctl failed: {e}, falling back to scan")
+        
+        # Try found USB devices first
+        for idx, name, dev in usb_devices:
+            log_camera.info(f"Trying USB camera: {name} at index {idx}")
+            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
             if cap.isOpened():
-                # Check if this looks like a USB camera (not CSI)
-                # USB cameras typically support MJPG or YUYV
-                backend = cap.getBackendName()
-                log_camera.debug(f"Found camera at index {idx}, backend: {backend}")
+                ret, frame = cap.read()
                 cap.release()
-                # Skip low indices if we have CSI camera (those are usually CSI)
-                if idx >= 2 or not CAMERA_AVAILABLE:
+                if ret and frame is not None:
+                    log_camera.info(f"USB camera found: {name} at index {idx}")
                     return idx
-            cap.release()
+        
+        # Fallback: scan higher indices that aren't typically used by Pi camera
+        # Pi camera uses /dev/video0-7, USB cameras usually get /dev/video8+
+        for idx in [8, 9, 10, 11, 12, 13, 14, 15, 2, 3, 4]:
+            log_camera.debug(f"Scanning index {idx} for USB camera")
+            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+            if cap.isOpened():
+                ret, frame = cap.read()
+                cap.release()
+                if ret and frame is not None:
+                    log_camera.info(f"USB camera found at index {idx} (fallback scan)")
+                    return idx
+        
+        log_camera.warning("No USB camera found after scanning all indices")
         return None
     
     def _initialize(self):
-        """Initialize USB camera."""
+        """Initialize USB camera using V4L2 backend."""
         try:
             # Find the camera
             idx = self._find_usb_camera()
             if idx is None:
                 log_camera.warning("No USB camera found")
+                print("  [USB CAM] Not found - check connection")
                 return
             
             self.camera_index = idx
-            log_camera.info(f"Initializing USB camera at index {idx}")
+            log_camera.info(f"Initializing USB camera at index {idx} with V4L2 backend")
             
-            self.camera = cv2.VideoCapture(idx)
+            # Use V4L2 backend explicitly to avoid GStreamer issues
+            self.camera = cv2.VideoCapture(idx, cv2.CAP_V4L2)
             if not self.camera.isOpened():
                 log_camera.error(f"Failed to open USB camera at index {idx}")
                 self.camera = None
+                print(f"  [USB CAM] Failed to open at index {idx}")
                 return
+            
+            # Set MJPG format for better performance with USB cameras
+            self.camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
             
             # Set resolution
             w, h = CONFIG.USB_CAMERA_RESOLUTION
             self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, w)
             self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
             
+            # Set buffer size to 1 to get latest frame
+            self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            
             # Get actual resolution
             actual_w = int(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
             actual_h = int(self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            # Verify we can actually read frames
+            ret, frame = self.camera.read()
+            if not ret or frame is None:
+                log_camera.error(f"USB camera at index {idx} cannot read frames")
+                self.camera.release()
+                self.camera = None
+                print(f"  [USB CAM] Cannot read frames from index {idx}")
+                return
             
             self.is_initialized = True
             log_camera.info(f"USB camera initialized: index={idx}, resolution={actual_w}x{actual_h}")
@@ -445,12 +505,28 @@ class USBCameraController:
     
     def _capture_loop(self):
         """Background capture loop without preview window."""
+        log_camera.info("USB camera capture loop started")
+        frame_count = 0
+        error_count = 0
+        max_errors = 30
+        
         while not self._stop_capture_flag:
             try:
+                if self.camera is None or not self.camera.isOpened():
+                    log_camera.error("USB camera not available in capture loop")
+                    break
+                
                 ret, frame = self.camera.read()
                 if not ret or frame is None:
-                    time.sleep(0.01)
+                    error_count += 1
+                    if error_count >= max_errors:
+                        log_camera.error(f"USB camera: too many read errors ({error_count})")
+                        break
+                    time.sleep(0.05)
                     continue
+                
+                error_count = 0  # Reset on success
+                frame_count += 1
                 
                 with self._frame_lock:
                     self.last_frame = frame.copy()
@@ -460,11 +536,20 @@ class USBCameraController:
                     self.video_writer.write(frame)
                     self.video_frame_count += 1
                 
+                # Log periodically
+                if frame_count % 100 == 0:
+                    log_camera.debug(f"USB camera: captured {frame_count} frames")
+                
                 time.sleep(0.033)  # ~30fps capture rate
                     
             except Exception as e:
                 log_camera.error(f"USB capture error: {e}")
-                break
+                error_count += 1
+                if error_count >= max_errors:
+                    break
+                time.sleep(0.1)
+        
+        log_camera.info(f"USB camera capture loop ended after {frame_count} frames")
     
     def _preview_loop(self):
         """Preview loop for USB camera with window."""
@@ -1146,15 +1231,22 @@ class DualCameraManager:
     def start_preview(self):
         """Start combined side-by-side preview for both cameras."""
         if not self.is_initialized or not CV2_AVAILABLE:
+            log_camera.warning("Cannot start preview: not initialized or no OpenCV")
             return False
         
         self.stop_preview_flag = False
         
         # Start USB camera background capture (no window)
-        if self.usb_camera:
+        if self.usb_camera and self.usb_camera.is_initialized:
+            log_camera.info("Starting USB camera background capture")
             self.usb_camera.start_preview()  # This starts _capture_loop since preview is disabled
+            # Give it a moment to start capturing
+            time.sleep(0.2)
+        else:
+            log_camera.warning("USB camera not available for preview")
         
         # Start combined preview thread
+        log_camera.info("Starting combined preview thread")
         self.preview_thread = threading.Thread(target=self._combined_preview_loop, daemon=True)
         self.preview_thread.start()
         self.preview_active = True
@@ -1200,17 +1292,20 @@ class DualCameraManager:
                 
                 # Get USB Camera frame
                 if self.usb_camera and self.usb_camera.is_initialized:
-                    with self.usb_camera._frame_lock:
-                        if self.usb_camera.last_frame is not None:
-                            usb_frame = cv2.resize(self.usb_camera.last_frame.copy(), (preview_w, preview_h))
-                            
-                            # Store for capture
-                            with self._frame_lock:
-                                self._usb_frame = usb_frame.copy()
-                            
-                            # Record to video if active
-                            if self.video_recording and self.usb_video_writer:
-                                self.usb_video_writer.write(usb_frame)
+                    try:
+                        with self.usb_camera._frame_lock:
+                            if self.usb_camera.last_frame is not None:
+                                usb_frame = cv2.resize(self.usb_camera.last_frame.copy(), (preview_w, preview_h))
+                                
+                                # Store for capture
+                                with self._frame_lock:
+                                    self._usb_frame = usb_frame.copy()
+                                
+                                # Record to video if active
+                                if self.video_recording and self.usb_video_writer:
+                                    self.usb_video_writer.write(usb_frame)
+                    except Exception as e:
+                        log_camera.debug(f"Error getting USB frame: {e}")
                 
                 # Create combined frame
                 if pi_frame is not None and usb_frame is not None:
