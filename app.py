@@ -65,11 +65,22 @@ class Config:
     VIDEO_CODEC = "mp4v"      # Options: "mp4v" (compatible), "avc1" (H.264, smaller), "XVID", "MJPG"
     VIDEO_FPS = 15            # Frames per second for scan video
     
-    # CAMERA SETTINGS
+    # PI CAMERA SETTINGS (CSI - Camera Module V3)
     CAMERA_RESOLUTION = (4608, 2592)
     CAMERA_PREVIEW_SIZE = (800, 600)
     CAMERA_QUALITY = 95
     CAPTURE_DELAY = 0.5
+    # Set to True if preview colors are wrong (swap R and B channels)
+    PREVIEW_SWAP_RB = False
+    
+    # USB CAMERA SETTINGS (Logitech BRIO or similar)
+    USB_CAMERA_ENABLED = True
+    USB_CAMERA_INDEX = 0      # Will auto-detect if this fails
+    USB_CAMERA_RESOLUTION = (1920, 1080)
+    USB_CAMERA_PREVIEW_SIZE = (640, 480)
+    
+    # DUAL CAMERA MODE
+    DUAL_CAMERA_ENABLED = True  # Capture from both cameras simultaneously
     
     # STORAGE SETTINGS
     LOCAL_STORAGE_PATH = os.path.join(os.path.expanduser("~"), "Desktop", "test_table", "scans")
@@ -311,12 +322,230 @@ class MotorController:
         self.enable_pin.close()
 
 # =============================================================================
-# CAMERA CONTROLLER
+# USB CAMERA CONTROLLER (Logitech BRIO / UVC cameras)
 # =============================================================================
-class CameraController:
-    """Camera controller with live preview support via OpenCV or native Picamera2."""
+class USBCameraController:
+    """Controller for USB webcams (Logitech BRIO, etc.) via OpenCV."""
     
-    PREVIEW_WINDOW = "Camera Preview - Press Q to close"
+    PREVIEW_WINDOW = "USB Camera Preview - Press Q to close"
+    
+    def __init__(self, camera_index=None):
+        self.camera = None
+        self.camera_index = camera_index
+        self.is_initialized = False
+        self.preview_active = False
+        self.preview_thread = None
+        self.stop_preview_flag = False
+        self._cleanup_lock = threading.Lock()
+        
+        # Video recording state
+        self.video_writer = None
+        self.video_recording = False
+        self.video_frame_count = 0
+        self.current_angle = 0
+        self.last_frame = None  # Store last frame for capture
+        
+        if CV2_AVAILABLE and CONFIG.USB_CAMERA_ENABLED:
+            self._initialize()
+    
+    def _find_usb_camera(self):
+        """Find USB camera index by scanning available devices."""
+        # Try the configured index first
+        if self.camera_index is not None:
+            cap = cv2.VideoCapture(self.camera_index)
+            if cap.isOpened():
+                cap.release()
+                return self.camera_index
+        
+        # Scan for USB cameras (typically higher indices than CSI)
+        # On Pi with CSI camera, USB cameras often start at index 2 or higher
+        for idx in [0, 1, 2, 3, 4, 8, 10]:
+            cap = cv2.VideoCapture(idx)
+            if cap.isOpened():
+                # Check if this looks like a USB camera (not CSI)
+                # USB cameras typically support MJPG or YUYV
+                backend = cap.getBackendName()
+                log_camera.debug(f"Found camera at index {idx}, backend: {backend}")
+                cap.release()
+                # Skip low indices if we have CSI camera (those are usually CSI)
+                if idx >= 2 or not CAMERA_AVAILABLE:
+                    return idx
+            cap.release()
+        return None
+    
+    def _initialize(self):
+        """Initialize USB camera."""
+        try:
+            # Find the camera
+            idx = self._find_usb_camera()
+            if idx is None:
+                log_camera.warning("No USB camera found")
+                return
+            
+            self.camera_index = idx
+            log_camera.info(f"Initializing USB camera at index {idx}")
+            
+            self.camera = cv2.VideoCapture(idx)
+            if not self.camera.isOpened():
+                log_camera.error(f"Failed to open USB camera at index {idx}")
+                self.camera = None
+                return
+            
+            # Set resolution
+            w, h = CONFIG.USB_CAMERA_RESOLUTION
+            self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+            self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+            
+            # Get actual resolution
+            actual_w = int(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_h = int(self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            self.is_initialized = True
+            log_camera.info(f"USB camera initialized: index={idx}, resolution={actual_w}x{actual_h}")
+            print(f"  [USB CAM] Initialized at index {idx} ({actual_w}x{actual_h})")
+            
+        except Exception as e:
+            log_camera.exception(f"USB camera initialization failed: {e}")
+            print(f"  [USB CAM] Init failed: {e}")
+            self.camera = None
+    
+    def start_preview(self):
+        """Start live preview in separate thread."""
+        if not self.is_initialized:
+            return False
+        
+        self.stop_preview_flag = False
+        self.preview_thread = threading.Thread(target=self._preview_loop, daemon=True)
+        self.preview_thread.start()
+        self.preview_active = True
+        return True
+    
+    def _preview_loop(self):
+        """Preview loop for USB camera."""
+        try:
+            cv2.namedWindow(self.PREVIEW_WINDOW, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(self.PREVIEW_WINDOW, 640, 480)
+        except Exception as e:
+            log_camera.error(f"Failed to create USB preview window: {e}")
+            return
+        
+        while not self.stop_preview_flag:
+            try:
+                ret, frame = self.camera.read()
+                if not ret or frame is None:
+                    time.sleep(0.01)
+                    continue
+                
+                self.last_frame = frame.copy()
+                
+                # Record if active
+                if self.video_recording and self.video_writer:
+                    self.video_writer.write(frame)
+                    self.video_frame_count += 1
+                
+                # Resize for preview
+                preview = cv2.resize(frame, CONFIG.USB_CAMERA_PREVIEW_SIZE)
+                cv2.imshow(self.PREVIEW_WINDOW, preview)
+                
+                if cv2.waitKey(16) & 0xFF == ord('q'):
+                    break
+                    
+            except Exception as e:
+                log_camera.error(f"USB preview error: {e}")
+                break
+        
+        try:
+            cv2.destroyWindow(self.PREVIEW_WINDOW)
+            cv2.waitKey(1)
+        except:
+            pass
+    
+    def stop_preview(self):
+        """Stop preview."""
+        self.stop_preview_flag = True
+        if self.preview_thread and self.preview_thread.is_alive():
+            self.preview_thread.join(timeout=2.0)
+        self.preview_active = False
+    
+    def capture(self, filepath, angle=None):
+        """Capture and save image."""
+        if not self.is_initialized:
+            return False
+        try:
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            
+            # Use last preview frame or capture new one
+            if self.last_frame is not None:
+                frame = self.last_frame.copy()
+            else:
+                ret, frame = self.camera.read()
+                if not ret:
+                    return False
+            
+            # Save image
+            cv2.imwrite(filepath, frame, [cv2.IMWRITE_JPEG_QUALITY, CONFIG.CAMERA_QUALITY])
+            
+            if os.path.exists(filepath):
+                log_camera.debug(f"USB cam captured: {os.path.basename(filepath)}")
+                return True
+            return False
+        except Exception as e:
+            log_camera.exception(f"USB capture error: {e}")
+            return False
+    
+    def start_video_recording(self, filepath):
+        """Start video recording."""
+        if not self.is_initialized:
+            return False
+        try:
+            fourcc = cv2.VideoWriter_fourcc(*CONFIG.VIDEO_CODEC)
+            w, h = CONFIG.USB_CAMERA_RESOLUTION
+            self.video_writer = cv2.VideoWriter(filepath, fourcc, CONFIG.VIDEO_FPS, (w, h))
+            if self.video_writer.isOpened():
+                self.video_recording = True
+                self.video_frame_count = 0
+                return True
+            return False
+        except:
+            return False
+    
+    def stop_video_recording(self):
+        """Stop video recording."""
+        self.video_recording = False
+        if self.video_writer:
+            self.video_writer.release()
+            self.video_writer = None
+    
+    def set_current_angle(self, angle):
+        self.current_angle = angle
+    
+    def get_status(self):
+        if not self.is_initialized:
+            return "NOT AVAILABLE"
+        return f"USB Cam idx={self.camera_index}"
+    
+    def cleanup(self):
+        """Release camera resources."""
+        with self._cleanup_lock:
+            log_camera.info("Cleaning up USB camera")
+            self.stop_video_recording()
+            self.stop_preview()
+            if self.camera:
+                self.camera.release()
+                self.camera = None
+            self.is_initialized = False
+            self.last_frame = None
+            gc.collect()
+            time.sleep(0.2)
+
+
+# =============================================================================
+# PI CAMERA CONTROLLER (CSI - Camera Module V3)
+# =============================================================================
+class PiCameraController:
+    """Pi Camera Module V3 controller with live preview via OpenCV."""
+    
+    PREVIEW_WINDOW = "Pi Camera Preview - Press Q to close"
     
     # Overlay settings
     OVERLAY_FONT = cv2.FONT_HERSHEY_SIMPLEX if CV2_AVAILABLE else None
@@ -432,8 +661,12 @@ class CameraController:
                         break
                     continue
                 
-                # Convert RGB (Picamera2 native) to BGR (OpenCV native)
-                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                # Picamera2 outputs RGB, OpenCV expects BGR
+                # If colors look wrong in preview, toggle CONFIG.PREVIEW_SWAP_RB
+                if CONFIG.PREVIEW_SWAP_RB:
+                    frame_bgr = frame  # Don't convert - already in correct format
+                else:
+                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                 
                 error_count = 0  # Reset on successful frame
                 frame_count += 1
@@ -710,7 +943,7 @@ class CameraController:
         concurrent cleanup/initialization attempts.
         """
         with self._cleanup_lock:
-            log_camera.info("Starting camera cleanup")
+            log_camera.info("Starting Pi camera cleanup")
             
             # Stop video recording first
             self.stop_video_recording()
@@ -731,6 +964,10 @@ class CameraController:
                     log_camera.debug("Camera stopped")
                 except Exception as e:
                     log_camera.debug(f"Camera stop exception (may be expected): {e}")
+                
+                # Small delay between stop and close
+                time.sleep(0.1)
+                
                 try:
                     self.camera.close()
                     log_camera.debug("Camera closed")
@@ -748,13 +985,318 @@ class CameraController:
             self.video_frame_count = 0
             self.current_angle = 0
             
-            # Force garbage collection to release camera hardware resources
+            # Force garbage collection multiple times to ensure cleanup
+            gc.collect()
+            time.sleep(0.2)
             gc.collect()
             
             # Allow hardware to fully release before potential re-init
-            # This delay is necessary for libcamera to release /dev/video* handles
-            time.sleep(0.3)
-            log_camera.info("Camera cleanup complete")
+            # This longer delay is necessary for libcamera to release /dev/video* handles
+            time.sleep(0.5)
+            log_camera.info("Pi camera cleanup complete")
+    
+    @staticmethod
+    def is_camera_available():
+        """Check if Pi camera hardware is available and not in use."""
+        if not CAMERA_AVAILABLE:
+            return False
+        try:
+            # Try to create a temporary Picamera2 instance
+            test_cam = Picamera2()
+            test_cam.close()
+            del test_cam
+            gc.collect()
+            time.sleep(0.1)
+            return True
+        except Exception as e:
+            log_camera.debug(f"Camera availability check failed: {e}")
+            return False
+
+# Backward compatibility alias
+CameraController = PiCameraController
+
+
+# =============================================================================
+# DUAL CAMERA MANAGER
+# =============================================================================
+class DualCameraManager:
+    """Manages both Pi Camera and USB camera simultaneously."""
+    
+    def __init__(self):
+        self.pi_camera = None
+        self.usb_camera = None
+        self.is_initialized = False
+        
+        log_camera.info("Initializing DualCameraManager")
+        
+        # Initialize Pi Camera (CSI)
+        if CAMERA_AVAILABLE:
+            self.pi_camera = PiCameraController()
+            if not self.pi_camera.is_initialized:
+                log_camera.warning("Pi camera initialization failed")
+                self.pi_camera = None
+        
+        # Initialize USB Camera
+        if CV2_AVAILABLE and CONFIG.USB_CAMERA_ENABLED:
+            self.usb_camera = USBCameraController()
+            if not self.usb_camera.is_initialized:
+                log_camera.warning("USB camera initialization failed")
+                self.usb_camera = None
+        
+        self.is_initialized = (self.pi_camera is not None) or (self.usb_camera is not None)
+        
+        if self.is_initialized:
+            cams = []
+            if self.pi_camera:
+                cams.append("Pi Camera V3")
+            if self.usb_camera:
+                cams.append("USB Camera")
+            log_camera.info(f"DualCameraManager ready with: {', '.join(cams)}")
+    
+    def start_preview(self):
+        """Start preview for both cameras."""
+        results = []
+        if self.pi_camera:
+            results.append(("Pi", self.pi_camera.start_preview()))
+        if self.usb_camera:
+            results.append(("USB", self.usb_camera.start_preview()))
+        return any(r[1] for r in results)
+    
+    def stop_preview(self):
+        """Stop preview for both cameras."""
+        if self.pi_camera:
+            self.pi_camera.stop_preview()
+        if self.usb_camera:
+            self.usb_camera.stop_preview()
+    
+    def capture(self, pi_filepath, usb_filepath=None, angle=None):
+        """Capture from both cameras.
+        
+        Returns: (pi_success, usb_success)
+        """
+        pi_ok = False
+        usb_ok = False
+        
+        if self.pi_camera and pi_filepath:
+            pi_ok = self.pi_camera.capture(pi_filepath, angle)
+        
+        if self.usb_camera and usb_filepath:
+            usb_ok = self.usb_camera.capture(usb_filepath, angle)
+        
+        return pi_ok, usb_ok
+    
+    def start_video_recording(self, pi_filepath, usb_filepath=None):
+        """Start video recording on both cameras."""
+        pi_ok = False
+        usb_ok = False
+        
+        if self.pi_camera and pi_filepath:
+            pi_ok = self.pi_camera.start_video_recording(pi_filepath)
+        
+        if self.usb_camera and usb_filepath:
+            usb_ok = self.usb_camera.start_video_recording(usb_filepath)
+        
+        return pi_ok, usb_ok
+    
+    def stop_video_recording(self):
+        """Stop video recording on both cameras."""
+        if self.pi_camera:
+            self.pi_camera.stop_video_recording()
+        if self.usb_camera:
+            self.usb_camera.stop_video_recording()
+    
+    def set_current_angle(self, angle):
+        """Set angle for overlay on both cameras."""
+        if self.pi_camera:
+            self.pi_camera.set_current_angle(angle)
+        if self.usb_camera:
+            self.usb_camera.set_current_angle(angle)
+    
+    def get_status(self):
+        """Get combined status."""
+        status = []
+        if self.pi_camera:
+            status.append(f"Pi: {self.pi_camera.get_status()}")
+        if self.usb_camera:
+            status.append(f"USB: {self.usb_camera.get_status()}")
+        return " | ".join(status) if status else "No cameras"
+    
+    def cleanup(self):
+        """Cleanup both cameras."""
+        log_camera.info("Cleaning up DualCameraManager")
+        if self.pi_camera:
+            self.pi_camera.cleanup()
+            self.pi_camera = None
+        if self.usb_camera:
+            self.usb_camera.cleanup()
+            self.usb_camera = None
+        self.is_initialized = False
+        gc.collect()
+        time.sleep(0.3)
+
+
+# =============================================================================
+# CAMERA SETTINGS CONTROLLER (Pi Camera V3 real-time adjustments)
+# =============================================================================
+class CameraSettingsController:
+    """Real-time camera settings adjustment with live preview for Pi Camera V3."""
+    
+    # Available controls for IMX708 (Pi Camera V3)
+    CONTROLS = {
+        'focus': {
+            'name': 'Manual Focus',
+            'control': 'LensPosition',
+            'min': 0.0,
+            'max': 15.0,
+            'step': 0.5,
+            'default': 1.0,
+            'unit': 'diopters (0=inf, 15=macro)'
+        },
+        'exposure': {
+            'name': 'Exposure Time',
+            'control': 'ExposureTime',
+            'min': 100,
+            'max': 1000000,
+            'step': 1000,
+            'default': 20000,
+            'unit': 'microseconds'
+        },
+        'gain': {
+            'name': 'Analogue Gain',
+            'control': 'AnalogueGain',
+            'min': 1.0,
+            'max': 16.0,
+            'step': 0.5,
+            'default': 1.0,
+            'unit': 'x'
+        },
+        'brightness': {
+            'name': 'Brightness',
+            'control': 'Brightness',
+            'min': -1.0,
+            'max': 1.0,
+            'step': 0.1,
+            'default': 0.0,
+            'unit': ''
+        },
+        'contrast': {
+            'name': 'Contrast',
+            'control': 'Contrast',
+            'min': 0.0,
+            'max': 2.0,
+            'step': 0.1,
+            'default': 1.0,
+            'unit': ''
+        },
+        'saturation': {
+            'name': 'Saturation',
+            'control': 'Saturation',
+            'min': 0.0,
+            'max': 2.0,
+            'step': 0.1,
+            'default': 1.0,
+            'unit': ''
+        },
+        'sharpness': {
+            'name': 'Sharpness',
+            'control': 'Sharpness',
+            'min': 0.0,
+            'max': 16.0,
+            'step': 1.0,
+            'default': 1.0,
+            'unit': ''
+        },
+    }
+    
+    def __init__(self, pi_camera):
+        """Initialize with a PiCameraController instance."""
+        self.pi_camera = pi_camera
+        self.current_values = {}
+        self.af_mode = 'continuous'  # 'continuous', 'manual', 'auto'
+        
+        # Initialize current values from defaults
+        for key, ctrl in self.CONTROLS.items():
+            self.current_values[key] = ctrl['default']
+    
+    def set_af_mode(self, mode):
+        """Set autofocus mode: 'continuous', 'manual', or 'auto'."""
+        if not self.pi_camera or not self.pi_camera.camera:
+            return False
+        
+        try:
+            if mode == 'continuous':
+                self.pi_camera.camera.set_controls({
+                    "AfMode": controls.AfModeEnum.Continuous,
+                    "AfSpeed": controls.AfSpeedEnum.Normal,
+                })
+            elif mode == 'manual':
+                self.pi_camera.camera.set_controls({
+                    "AfMode": controls.AfModeEnum.Manual,
+                })
+            elif mode == 'auto':
+                self.pi_camera.camera.set_controls({
+                    "AfMode": controls.AfModeEnum.Auto,
+                })
+                # Trigger single autofocus
+                self.pi_camera.camera.set_controls({
+                    "AfTrigger": controls.AfTriggerEnum.Start,
+                })
+            
+            self.af_mode = mode
+            log_camera.info(f"AF mode set to: {mode}")
+            return True
+        except Exception as e:
+            log_camera.error(f"Failed to set AF mode: {e}")
+            return False
+    
+    def set_control(self, key, value):
+        """Set a camera control value."""
+        if key not in self.CONTROLS:
+            return False
+        if not self.pi_camera or not self.pi_camera.camera:
+            return False
+        
+        ctrl = self.CONTROLS[key]
+        # Clamp value to valid range
+        value = max(ctrl['min'], min(ctrl['max'], value))
+        
+        try:
+            # Special handling for focus (requires manual AF mode)
+            if key == 'focus':
+                if self.af_mode != 'manual':
+                    self.set_af_mode('manual')
+            
+            self.pi_camera.camera.set_controls({ctrl['control']: value})
+            self.current_values[key] = value
+            log_camera.debug(f"Set {key} to {value}")
+            return True
+        except Exception as e:
+            log_camera.error(f"Failed to set {key}: {e}")
+            return False
+    
+    def get_control(self, key):
+        """Get current value of a control."""
+        return self.current_values.get(key)
+    
+    def adjust_control(self, key, delta):
+        """Adjust a control by delta amount."""
+        if key not in self.CONTROLS:
+            return False
+        
+        current = self.current_values.get(key, self.CONTROLS[key]['default'])
+        new_value = current + delta
+        return self.set_control(key, new_value)
+    
+    def reset_to_defaults(self):
+        """Reset all controls to defaults."""
+        for key, ctrl in self.CONTROLS.items():
+            self.set_control(key, ctrl['default'])
+        self.set_af_mode('continuous')
+    
+    def get_all_values(self):
+        """Get dictionary of all current values."""
+        return self.current_values.copy()
+
 
 # =============================================================================
 # STORAGE MANAGER
@@ -764,28 +1306,60 @@ class StorageManager:
         self.local_path = CONFIG.LOCAL_STORAGE_PATH
         self.current_piece_id = None
         self.current_folder = None
+        self.pi_folder = None   # Subfolder for Pi camera images
+        self.usb_folder = None  # Subfolder for USB camera images
         os.makedirs(self.local_path, exist_ok=True)
     
-    def set_piece_id(self, piece_number):
+    def set_piece_id(self, piece_number, dual_camera=False):
         self.current_piece_id = CONFIG.PIECE_ID_FORMAT.format(int(piece_number))
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.current_folder = os.path.join(self.local_path, f"{self.current_piece_id}_{timestamp}")
         os.makedirs(self.current_folder, exist_ok=True)
-        log_storage.info(f"New scan: piece_id={self.current_piece_id}, folder={self.current_folder}")
+        
+        # Create subfolders for dual camera mode
+        if dual_camera and CONFIG.DUAL_CAMERA_ENABLED:
+            self.pi_folder = os.path.join(self.current_folder, "pi_camera")
+            self.usb_folder = os.path.join(self.current_folder, "usb_camera")
+            os.makedirs(self.pi_folder, exist_ok=True)
+            os.makedirs(self.usb_folder, exist_ok=True)
+            log_storage.info(f"New dual-camera scan: piece_id={self.current_piece_id}")
+        else:
+            self.pi_folder = self.current_folder
+            self.usb_folder = None
+            log_storage.info(f"New scan: piece_id={self.current_piece_id}, folder={self.current_folder}")
+        
         return self.current_piece_id
     
-    def get_filepath(self, angle):
+    def get_filepath(self, angle, camera='pi'):
+        """Get filepath for image.
+        
+        Args:
+            angle: Rotation angle
+            camera: 'pi' for Pi camera, 'usb' for USB camera
+        """
         if not self.current_piece_id:
             raise ValueError("Piece ID not set")
-        filename = f"{CONFIG.FILE_PREFIX}_{self.current_piece_id}_{int(angle):03d}deg.{CONFIG.FILE_EXTENSION}"
-        return os.path.join(self.current_folder, filename)
+        
+        folder = self.pi_folder if camera == 'pi' else self.usb_folder
+        if folder is None:
+            folder = self.current_folder
+        
+        cam_suffix = f"_{camera}" if self.usb_folder else ""
+        filename = f"{CONFIG.FILE_PREFIX}_{self.current_piece_id}_{int(angle):03d}deg{cam_suffix}.{CONFIG.FILE_EXTENSION}"
+        return os.path.join(folder, filename)
     
-    def get_video_filepath(self):
+    def get_video_filepath(self, camera='pi'):
         """Get filepath for scan video."""
         if not self.current_piece_id:
             raise ValueError("Piece ID not set")
-        filename = f"{CONFIG.FILE_PREFIX}_{self.current_piece_id}_scan.mp4"
-        return os.path.join(self.current_folder, filename)
+        
+        folder = self.pi_folder if camera == 'pi' else self.usb_folder
+        if folder is None:
+            folder = self.current_folder
+        
+        cam_suffix = f"_{camera}" if self.usb_folder else ""
+        filename = f"{CONFIG.FILE_PREFIX}_{self.current_piece_id}_scan{cam_suffix}.mp4"
+        return os.path.join(folder, filename)
     
     def get_image_count(self):
         if not self.current_folder or not os.path.exists(self.current_folder):
@@ -827,11 +1401,22 @@ class Application:
         print("=" * 100)
         print(f"\n  Current Settings: Increment={CONFIG.ROTATION_INCREMENT}deg | Photos={CONFIG.TOTAL_PHOTOS} | Calibration={CONFIG.CALIBRATION_FACTOR:.4f}")
         print(f"  Storage: {CONFIG.LOCAL_STORAGE_PATH}")
+        
+        # Camera status
+        cam_status = []
+        if CAMERA_AVAILABLE:
+            cam_status.append("Pi Cam V3")
+        if CV2_AVAILABLE and CONFIG.USB_CAMERA_ENABLED:
+            cam_status.append("USB Cam")
+        dual_status = "ENABLED" if CONFIG.DUAL_CAMERA_ENABLED and len(cam_status) > 1 else "DISABLED"
+        print(f"  Cameras: {', '.join(cam_status) if cam_status else 'None'} | Dual Mode: {dual_status}")
+        
         print("\n" + "-" * 100)
         print("\n    [1] LAUNCH CAPTURE        Start 360 degree scan with live preview")
         print("    [2] TEST CAMERA           View continuous video feed (no saving)")
         print("    [3] TEST MOTOR            Motor control and calibration")
-        print("    [4] INFORMATION           Wiring diagram and documentation")
+        print("    [4] CAMERA SETTINGS       Adjust focus, exposure, zoom (Pi Camera)")
+        print("    [5] INFORMATION           Wiring diagram and documentation")
         print("    [0] EXIT")
         print("\n" + "=" * 100)
     
@@ -848,13 +1433,15 @@ class Application:
             elif choice == "3":
                 self.test_motor_menu()
             elif choice == "4":
+                self.camera_settings_menu()
+            elif choice == "5":
                 self.show_information()
             elif choice == "0":
                 print("\n  Exiting. Goodbye.")
                 break
     
     def launch_capture(self):
-        """Run full 360 degree capture with live preview."""
+        """Run full 360 degree capture with live preview (supports dual camera)."""
         self.show_header()
         print("\n" + "=" * 100)
         print("                                   360 DEGREE CAPTURE")
@@ -870,18 +1457,32 @@ class Application:
             time.sleep(1)
             return
         
+        # Determine if using dual camera mode
+        use_dual = CONFIG.DUAL_CAMERA_ENABLED and CONFIG.USB_CAMERA_ENABLED
+        
         print("\n  Initializing hardware...")
-        progress_bar(0, 3, "  Init")
+        progress_bar(0, 4, "  Init")
         
         self.motor = MotorController()
-        progress_bar(1, 3, "  Init")
+        progress_bar(1, 4, "  Init")
         
-        self.camera = CameraController()
-        progress_bar(2, 3, "  Init")
+        # Use DualCameraManager if dual mode, else single PiCameraController
+        if use_dual:
+            self.camera = DualCameraManager()
+            print("\n  [DUAL CAM] Dual camera mode enabled")
+        else:
+            self.camera = PiCameraController()
+        progress_bar(2, 4, "  Init")
+        
+        if not self.camera.is_initialized:
+            print("\n  ERROR: No cameras initialized. Check connections.")
+            input("\n  Press ENTER to continue...")
+            return
         
         self.storage = StorageManager()
-        piece_id = self.storage.set_piece_id(piece_number)
-        progress_bar(3, 3, "  Init")
+        piece_id = self.storage.set_piece_id(piece_number, dual_camera=use_dual)
+        progress_bar(3, 4, "  Init")
+        progress_bar(4, 4, "  Init")
         
         print(f"\n  Piece ID: {piece_id}")
         print(f"  Output: {self.storage.current_folder}")
@@ -890,25 +1491,38 @@ class Application:
         print("\n  Starting live preview...")
         preview_ok = self.camera.start_preview()
         if preview_ok:
-            print("  [PREVIEW] Live video window opened")
+            print("  [PREVIEW] Live video window(s) opened")
         else:
             print("  [PREVIEW] Running without preview window")
         
         # Start video recording
-        video_path = self.storage.get_video_filepath()
-        video_ok = self.camera.start_video_recording(video_path)
-        if video_ok:
-            print(f"  [VIDEO] Recording to: {os.path.basename(video_path)}")
+        if use_dual and isinstance(self.camera, DualCameraManager):
+            pi_video = self.storage.get_video_filepath('pi')
+            usb_video = self.storage.get_video_filepath('usb')
+            pi_vid_ok, usb_vid_ok = self.camera.start_video_recording(pi_video, usb_video)
+            video_ok = pi_vid_ok or usb_vid_ok
+            if pi_vid_ok:
+                print(f"  [VIDEO] Pi camera recording to: {os.path.basename(pi_video)}")
+            if usb_vid_ok:
+                print(f"  [VIDEO] USB camera recording to: {os.path.basename(usb_video)}")
         else:
+            video_path = self.storage.get_video_filepath()
+            video_ok = self.camera.start_video_recording(video_path) if hasattr(self.camera, 'start_video_recording') else False
+            if video_ok:
+                print(f"  [VIDEO] Recording to: {os.path.basename(video_path)}")
+        
+        if not video_ok:
             print("  [VIDEO] Video recording not available")
         
         print(f"\n  Starting scan... Press Ctrl+C to abort.\n")
         
         self.motor.enable()
         self.motor.reset_position()
-        self.camera.set_current_angle(0)  # Initialize angle for overlay
+        self.camera.set_current_angle(0)
         
-        captured = 0
+        pi_captured = 0
+        usb_captured = 0
+        
         try:
             for i in range(CONFIG.TOTAL_PHOTOS):
                 current_angle = i * CONFIG.ROTATION_INCREMENT
@@ -918,20 +1532,35 @@ class Application:
                 
                 # Status update
                 status = self.camera.get_status()
-                print(f"  [{i+1:2d}/{CONFIG.TOTAL_PHOTOS}] Angle: {current_angle:03d}deg | {status} | ", end="")
+                print(f"  [{i+1:2d}/{CONFIG.TOTAL_PHOTOS}] Angle: {current_angle:03d}deg | {status}")
                 
                 time.sleep(CONFIG.CAPTURE_DELAY)
                 
-                # Capture and save with angle overlay
-                filepath = self.storage.get_filepath(current_angle)
-                success = self.camera.capture(filepath, angle=current_angle)
-                
-                if success:
-                    captured += 1
-                    size = os.path.getsize(filepath) if os.path.exists(filepath) else 0
-                    print(f"SAVED ({size/1024:.0f}KB)")
+                # Capture from both cameras
+                if use_dual and isinstance(self.camera, DualCameraManager):
+                    pi_path = self.storage.get_filepath(current_angle, 'pi')
+                    usb_path = self.storage.get_filepath(current_angle, 'usb')
+                    pi_ok, usb_ok = self.camera.capture(pi_path, usb_path, angle=current_angle)
+                    
+                    results = []
+                    if pi_ok:
+                        pi_captured += 1
+                        size = os.path.getsize(pi_path) / 1024 if os.path.exists(pi_path) else 0
+                        results.append(f"Pi:{size:.0f}KB")
+                    if usb_ok:
+                        usb_captured += 1
+                        size = os.path.getsize(usb_path) / 1024 if os.path.exists(usb_path) else 0
+                        results.append(f"USB:{size:.0f}KB")
+                    print(f"    -> SAVED ({', '.join(results)})" if results else "    -> FAILED")
                 else:
-                    print("FAILED")
+                    filepath = self.storage.get_filepath(current_angle)
+                    success = self.camera.capture(filepath, angle=current_angle)
+                    if success:
+                        pi_captured += 1
+                        size = os.path.getsize(filepath) / 1024 if os.path.exists(filepath) else 0
+                        print(f"    -> SAVED ({size:.0f}KB)")
+                    else:
+                        print("    -> FAILED")
                 
                 progress_bar(i + 1, CONFIG.TOTAL_PHOTOS, "  Progress")
                 
@@ -949,13 +1578,15 @@ class Application:
             self.motor.cleanup()
             self.camera.cleanup()
         
+        # Summary
         print("\n" + "=" * 100)
-        print(f"  SCAN COMPLETE: {captured}/{CONFIG.TOTAL_PHOTOS} images")
-        log_main.info(f"Scan complete: {captured}/{CONFIG.TOTAL_PHOTOS} images for piece {piece_id}")
-        if video_ok and os.path.exists(video_path):
-            video_size = os.path.getsize(video_path) / (1024 * 1024)
-            print(f"  VIDEO: {os.path.basename(video_path)} ({video_size:.1f}MB)")
-            log_main.info(f"Video saved: {video_path} ({video_size:.1f}MB)")
+        if use_dual:
+            print(f"  SCAN COMPLETE: Pi={pi_captured}/{CONFIG.TOTAL_PHOTOS}, USB={usb_captured}/{CONFIG.TOTAL_PHOTOS}")
+            log_main.info(f"Dual scan complete: Pi={pi_captured}, USB={usb_captured} for piece {piece_id}")
+        else:
+            print(f"  SCAN COMPLETE: {pi_captured}/{CONFIG.TOTAL_PHOTOS} images")
+            log_main.info(f"Scan complete: {pi_captured}/{CONFIG.TOTAL_PHOTOS} images for piece {piece_id}")
+        
         print(f"  Location: {self.storage.current_folder}")
         print("=" * 100)
         
@@ -972,10 +1603,35 @@ class Application:
         print("                                CAMERA TEST - LIVE PREVIEW")
         print("=" * 100)
         
-        self.camera = CameraController()
+        # Ask which camera to test
+        print("\n  Select camera to test:")
+        print("    [1] Pi Camera V3 (CSI)")
+        print("    [2] USB Camera (Logitech BRIO)")
+        print("    [3] Both cameras (dual preview)")
+        print("    [0] Cancel")
         
-        if not self.camera.is_initialized and CAMERA_AVAILABLE:
-            print("\n  Camera not initialized. Check connection.")
+        cam_choice = input("\n  Enter option: ").strip()
+        
+        if cam_choice == "0":
+            return
+        elif cam_choice == "1":
+            self.camera = PiCameraController()
+            cam_name = "Pi Camera"
+        elif cam_choice == "2":
+            self.camera = USBCameraController()
+            cam_name = "USB Camera"
+        elif cam_choice == "3":
+            self.camera = DualCameraManager()
+            cam_name = "Dual Cameras"
+        else:
+            print("  Invalid option.")
+            time.sleep(1)
+            return
+        
+        if not self.camera.is_initialized:
+            print(f"\n  {cam_name} not initialized. Check connection.")
+            if hasattr(self.camera, 'cleanup'):
+                self.camera.cleanup()
             input("\n  Press ENTER to continue...")
             return
         
@@ -983,26 +1639,27 @@ class Application:
         preview_ok = self.camera.start_preview()
         
         if preview_ok:
-            if CV2_AVAILABLE:
-                print("\n  [PREVIEW] Live video window opened (OpenCV)")
-                print("  [PREVIEW] Press 'Q' in the preview window OR Ctrl+C here to stop")
-            else:
-                print("\n  [PREVIEW] Live video window opened (native)")
-                print("  [PREVIEW] Press Ctrl+C to stop")
+            print(f"\n  [PREVIEW] {cam_name} live video window opened")
+            print("  [PREVIEW] Press 'Q' in preview window OR Ctrl+C here to stop")
         else:
             print("\n  [PREVIEW] Could not open preview window.")
-            if not CAMERA_AVAILABLE:
-                print("  [PREVIEW] Camera hardware not detected (mock mode).")
         
         print("\n  Streaming live video...\n")
         
         try:
             frame = 0
             while True:
-                # Check if OpenCV preview thread stopped (user pressed Q)
-                if CV2_AVAILABLE and self.camera.preview_thread:
+                # Check if preview thread stopped (user pressed Q)
+                if hasattr(self.camera, 'preview_thread') and self.camera.preview_thread:
                     if not self.camera.preview_thread.is_alive():
                         print("\n\n  Preview window closed.")
+                        break
+                # For DualCameraManager, check both
+                elif isinstance(self.camera, DualCameraManager):
+                    pi_alive = self.camera.pi_camera and self.camera.pi_camera.preview_thread and self.camera.pi_camera.preview_thread.is_alive()
+                    usb_alive = self.camera.usb_camera and self.camera.usb_camera.preview_thread and self.camera.usb_camera.preview_thread.is_alive()
+                    if not pi_alive and not usb_alive:
+                        print("\n\n  All preview windows closed.")
                         break
                 
                 frame += 1
@@ -1015,6 +1672,98 @@ class Application:
         print("\n\n  Stopping preview...")
         self.camera.cleanup()
         
+        input("\n  Press ENTER to continue...")
+    
+    def camera_settings_menu(self):
+        """Interactive camera settings adjustment with live preview."""
+        self.show_header()
+        print("\n" + "=" * 100)
+        print("                            CAMERA SETTINGS - LIVE ADJUSTMENT")
+        print("=" * 100)
+        
+        if not CAMERA_AVAILABLE:
+            print("\n  Pi Camera not available.")
+            input("\n  Press ENTER to continue...")
+            return
+        
+        print("\n  Initializing camera with live preview...")
+        self.camera = PiCameraController()
+        
+        if not self.camera.is_initialized:
+            print("  Camera initialization failed.")
+            input("\n  Press ENTER to continue...")
+            return
+        
+        # Create settings controller
+        settings = CameraSettingsController(self.camera)
+        
+        # Start preview
+        preview_ok = self.camera.start_preview()
+        if not preview_ok:
+            print("  Warning: Preview window could not be opened.")
+        else:
+            print("  [PREVIEW] Live preview opened - changes apply in real-time")
+        
+        while True:
+            print("\n" + "-" * 80)
+            print("  CURRENT SETTINGS:")
+            print(f"    AF Mode: {settings.af_mode}")
+            for key, ctrl in CameraSettingsController.CONTROLS.items():
+                val = settings.get_control(key)
+                print(f"    {ctrl['name']}: {val} {ctrl['unit']}")
+            
+            print("\n  COMMANDS:")
+            print("    [1] Focus       [2] Exposure    [3] Gain")
+            print("    [4] Brightness  [5] Contrast    [6] Saturation  [7] Sharpness")
+            print("    [A] AF Mode (continuous/manual/auto)")
+            print("    [R] Reset all to defaults")
+            print("    [S] Toggle preview color swap (fix yellow->blue)")
+            print("    [0] Exit settings")
+            
+            cmd = input("\n  Enter command: ").strip().lower()
+            
+            if cmd == "0":
+                break
+            elif cmd == "r":
+                settings.reset_to_defaults()
+                print("  Reset to defaults.")
+            elif cmd == "s":
+                CONFIG.PREVIEW_SWAP_RB = not CONFIG.PREVIEW_SWAP_RB
+                print(f"  Preview color swap: {'ENABLED' if CONFIG.PREVIEW_SWAP_RB else 'DISABLED'}")
+                print("  (Restart preview to see effect)")
+            elif cmd == "a":
+                print("\n  AF Modes: [1] Continuous  [2] Manual  [3] Auto (one-shot)")
+                af_choice = input("  Select: ").strip()
+                if af_choice == "1":
+                    settings.set_af_mode('continuous')
+                elif af_choice == "2":
+                    settings.set_af_mode('manual')
+                elif af_choice == "3":
+                    settings.set_af_mode('auto')
+            elif cmd in ["1", "2", "3", "4", "5", "6", "7"]:
+                key_map = {"1": "focus", "2": "exposure", "3": "gain", 
+                          "4": "brightness", "5": "contrast", "6": "saturation", "7": "sharpness"}
+                key = key_map[cmd]
+                ctrl = CameraSettingsController.CONTROLS[key]
+                current = settings.get_control(key)
+                
+                print(f"\n  {ctrl['name']}: current={current}, range=[{ctrl['min']}, {ctrl['max']}], step={ctrl['step']}")
+                print("  Enter new value, or +/- to adjust by step:")
+                
+                val_input = input(f"  [{key}] = ").strip()
+                if val_input == "+":
+                    settings.adjust_control(key, ctrl['step'])
+                elif val_input == "-":
+                    settings.adjust_control(key, -ctrl['step'])
+                elif val_input:
+                    try:
+                        new_val = float(val_input)
+                        settings.set_control(key, new_val)
+                    except ValueError:
+                        print("  Invalid value.")
+        
+        print("\n  Closing camera...")
+        self.camera.cleanup()
         input("\n  Press ENTER to continue...")
     
     def test_motor_menu(self):
