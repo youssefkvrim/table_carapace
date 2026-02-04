@@ -1089,35 +1089,49 @@ CameraController = PiCameraController
 class DualCameraManager:
     """Manages both Pi Camera and USB camera simultaneously.
     
-    IMPORTANT: When both cameras are active, USB camera runs in background
-    capture mode (no preview window) to avoid Qt/threading conflicts with
-    Picamera2. Only Pi Camera preview is shown.
+    Uses a COMBINED side-by-side preview window to show both cameras
+    without Qt/threading conflicts. Both camera feeds are displayed
+    in a single OpenCV window.
     """
+    
+    PREVIEW_WINDOW = "Dual Camera Preview - Press Q to close"
     
     def __init__(self):
         self.pi_camera = None
         self.usb_camera = None
         self.is_initialized = False
+        self.preview_active = False
+        self.preview_thread = None
+        self.stop_preview_flag = False
+        self._cleanup_lock = threading.Lock()
+        
+        # Frame storage for combined preview
+        self._pi_frame = None
+        self._usb_frame = None
+        self._frame_lock = threading.Lock()
+        
+        # Video recording
+        self.pi_video_writer = None
+        self.usb_video_writer = None
+        self.video_recording = False
+        self.current_angle = 0
         
         log_camera.info("Initializing DualCameraManager")
         
-        # Initialize Pi Camera (CSI)
+        # Initialize Pi Camera (CSI) - but DON'T start its own preview
         if CAMERA_AVAILABLE:
             self.pi_camera = PiCameraController()
             if not self.pi_camera.is_initialized:
                 log_camera.warning("Pi camera initialization failed")
                 self.pi_camera = None
         
-        # Initialize USB Camera - DISABLE preview if Pi camera is active to avoid Qt conflicts
+        # Initialize USB Camera - DON'T start its own preview either
         if CV2_AVAILABLE and CONFIG.USB_CAMERA_ENABLED:
-            # When Pi camera is active, USB runs without preview to avoid segfaults
-            usb_preview_enabled = (self.pi_camera is None)
-            self.usb_camera = USBCameraController(enable_preview=usb_preview_enabled)
+            # Disable individual preview - we'll use combined preview
+            self.usb_camera = USBCameraController(enable_preview=False)
             if not self.usb_camera.is_initialized:
                 log_camera.warning("USB camera initialization failed")
                 self.usb_camera = None
-            elif not usb_preview_enabled:
-                log_camera.info("USB camera preview disabled (running alongside Pi camera)")
         
         self.is_initialized = (self.pi_camera is not None) or (self.usb_camera is not None)
         
@@ -1126,24 +1140,137 @@ class DualCameraManager:
             if self.pi_camera:
                 cams.append("Pi Camera V3")
             if self.usb_camera:
-                cams.append("USB Camera (background)")
+                cams.append("USB Camera")
             log_camera.info(f"DualCameraManager ready with: {', '.join(cams)}")
     
     def start_preview(self):
-        """Start preview for both cameras."""
-        results = []
-        if self.pi_camera:
-            results.append(("Pi", self.pi_camera.start_preview()))
+        """Start combined side-by-side preview for both cameras."""
+        if not self.is_initialized or not CV2_AVAILABLE:
+            return False
+        
+        self.stop_preview_flag = False
+        
+        # Start USB camera background capture (no window)
         if self.usb_camera:
-            results.append(("USB", self.usb_camera.start_preview()))
-        return any(r[1] for r in results)
+            self.usb_camera.start_preview()  # This starts _capture_loop since preview is disabled
+        
+        # Start combined preview thread
+        self.preview_thread = threading.Thread(target=self._combined_preview_loop, daemon=True)
+        self.preview_thread.start()
+        self.preview_active = True
+        return True
+    
+    def _combined_preview_loop(self):
+        """Combined preview showing both cameras side-by-side in ONE window."""
+        try:
+            cv2.namedWindow(self.PREVIEW_WINDOW, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(self.PREVIEW_WINDOW, 1280, 480)  # Side by side
+        except Exception as e:
+            log_camera.error(f"Failed to create combined preview window: {e}")
+            return
+        
+        preview_w, preview_h = 640, 480  # Size for each camera in combined view
+        
+        while not self.stop_preview_flag:
+            try:
+                pi_frame = None
+                usb_frame = None
+                
+                # Get Pi Camera frame
+                if self.pi_camera and self.pi_camera.is_initialized and self.pi_camera.camera:
+                    try:
+                        frame = self.pi_camera.camera.capture_array("lores")
+                        if frame is not None:
+                            # Convert RGB to BGR for OpenCV
+                            if CONFIG.PREVIEW_SWAP_RB:
+                                pi_frame = frame
+                            else:
+                                pi_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                            pi_frame = cv2.resize(pi_frame, (preview_w, preview_h))
+                            
+                            # Store for capture
+                            with self._frame_lock:
+                                self._pi_frame = pi_frame.copy()
+                            
+                            # Record to video if active
+                            if self.video_recording and self.pi_video_writer:
+                                self.pi_video_writer.write(pi_frame)
+                    except Exception as e:
+                        log_camera.debug(f"Pi frame capture error: {e}")
+                
+                # Get USB Camera frame
+                if self.usb_camera and self.usb_camera.is_initialized:
+                    with self.usb_camera._frame_lock:
+                        if self.usb_camera.last_frame is not None:
+                            usb_frame = cv2.resize(self.usb_camera.last_frame.copy(), (preview_w, preview_h))
+                            
+                            # Store for capture
+                            with self._frame_lock:
+                                self._usb_frame = usb_frame.copy()
+                            
+                            # Record to video if active
+                            if self.video_recording and self.usb_video_writer:
+                                self.usb_video_writer.write(usb_frame)
+                
+                # Create combined frame
+                if pi_frame is not None and usb_frame is not None:
+                    # Both cameras - side by side
+                    combined = cv2.hconcat([pi_frame, usb_frame])
+                    # Add labels
+                    cv2.putText(combined, "Pi Camera V3", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                               1, (0, 255, 0), 2, cv2.LINE_AA)
+                    cv2.putText(combined, "USB Camera", (preview_w + 10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                               1, (0, 255, 0), 2, cv2.LINE_AA)
+                elif pi_frame is not None:
+                    combined = pi_frame
+                    cv2.putText(combined, "Pi Camera V3", (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                               1, (0, 255, 0), 2, cv2.LINE_AA)
+                elif usb_frame is not None:
+                    combined = usb_frame
+                    cv2.putText(combined, "USB Camera", (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                               1, (0, 255, 0), 2, cv2.LINE_AA)
+                else:
+                    # No frames - create blank
+                    combined = cv2.imread.__self__  # Placeholder, will skip
+                    time.sleep(0.05)
+                    continue
+                
+                # Add angle overlay
+                angle_text = f"Angle: {int(self.current_angle):03d} deg"
+                cv2.putText(combined, angle_text, (combined.shape[1] - 200, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+                
+                cv2.imshow(self.PREVIEW_WINDOW, combined)
+                
+                if cv2.waitKey(16) & 0xFF == ord('q'):
+                    break
+                    
+            except Exception as e:
+                log_camera.error(f"Combined preview error: {e}")
+                time.sleep(0.1)
+        
+        try:
+            cv2.destroyWindow(self.PREVIEW_WINDOW)
+            cv2.waitKey(1)
+            cv2.destroyAllWindows()
+            cv2.waitKey(1)
+        except:
+            pass
     
     def stop_preview(self):
-        """Stop preview for both cameras."""
-        if self.pi_camera:
-            self.pi_camera.stop_preview()
+        """Stop combined preview."""
+        self.stop_preview_flag = True
+        
+        # Stop USB camera capture thread
         if self.usb_camera:
             self.usb_camera.stop_preview()
+        
+        # Wait for combined preview thread
+        if self.preview_thread and self.preview_thread.is_alive():
+            self.preview_thread.join(timeout=2.0)
+        
+        self.preview_active = False
+        self.preview_thread = None
     
     def capture(self, pi_filepath, usb_filepath=None, angle=None):
         """Capture from both cameras.
@@ -1153,9 +1280,11 @@ class DualCameraManager:
         pi_ok = False
         usb_ok = False
         
+        # Capture from Pi camera
         if self.pi_camera and pi_filepath:
             pi_ok = self.pi_camera.capture(pi_filepath, angle)
         
+        # Capture from USB camera
         if self.usb_camera and usb_filepath:
             usb_ok = self.usb_camera.capture(usb_filepath, angle)
         
@@ -1166,23 +1295,53 @@ class DualCameraManager:
         pi_ok = False
         usb_ok = False
         
-        if self.pi_camera and pi_filepath:
-            pi_ok = self.pi_camera.start_video_recording(pi_filepath)
+        preview_size = (640, 480)  # Match combined preview size
+        fps = CONFIG.VIDEO_FPS
         
-        if self.usb_camera and usb_filepath:
-            usb_ok = self.usb_camera.start_video_recording(usb_filepath)
+        if pi_filepath:
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*CONFIG.VIDEO_CODEC)
+                self.pi_video_writer = cv2.VideoWriter(pi_filepath, fourcc, fps, preview_size)
+                pi_ok = self.pi_video_writer.isOpened()
+                if pi_ok:
+                    log_camera.info(f"Pi video recording started: {pi_filepath}")
+            except Exception as e:
+                log_camera.error(f"Failed to start Pi video: {e}")
         
+        if usb_filepath:
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*CONFIG.VIDEO_CODEC)
+                self.usb_video_writer = cv2.VideoWriter(usb_filepath, fourcc, fps, preview_size)
+                usb_ok = self.usb_video_writer.isOpened()
+                if usb_ok:
+                    log_camera.info(f"USB video recording started: {usb_filepath}")
+            except Exception as e:
+                log_camera.error(f"Failed to start USB video: {e}")
+        
+        self.video_recording = pi_ok or usb_ok
         return pi_ok, usb_ok
     
     def stop_video_recording(self):
         """Stop video recording on both cameras."""
-        if self.pi_camera:
-            self.pi_camera.stop_video_recording()
-        if self.usb_camera:
-            self.usb_camera.stop_video_recording()
+        self.video_recording = False
+        
+        if self.pi_video_writer:
+            try:
+                self.pi_video_writer.release()
+            except:
+                pass
+            self.pi_video_writer = None
+        
+        if self.usb_video_writer:
+            try:
+                self.usb_video_writer.release()
+            except:
+                pass
+            self.usb_video_writer = None
     
     def set_current_angle(self, angle):
-        """Set angle for overlay on both cameras."""
+        """Set angle for overlay."""
+        self.current_angle = angle
         if self.pi_camera:
             self.pi_camera.set_current_angle(angle)
         if self.usb_camera:
@@ -1191,24 +1350,41 @@ class DualCameraManager:
     def get_status(self):
         """Get combined status."""
         status = []
-        if self.pi_camera:
+        if self.pi_camera and self.pi_camera.is_initialized:
             status.append(f"Pi: {self.pi_camera.get_status()}")
-        if self.usb_camera:
-            status.append(f"USB: {self.usb_camera.get_status()}")
+        if self.usb_camera and self.usb_camera.is_initialized:
+            status.append("USB: Active")
         return " | ".join(status) if status else "No cameras"
     
     def cleanup(self):
-        """Cleanup both cameras."""
-        log_camera.info("Cleaning up DualCameraManager")
-        if self.pi_camera:
-            self.pi_camera.cleanup()
-            self.pi_camera = None
-        if self.usb_camera:
-            self.usb_camera.cleanup()
-            self.usb_camera = None
-        self.is_initialized = False
-        gc.collect()
-        time.sleep(0.3)
+        """Cleanup both cameras and preview."""
+        with self._cleanup_lock:
+            log_camera.info("Cleaning up DualCameraManager")
+            
+            # Stop video recording
+            self.stop_video_recording()
+            
+            # Stop combined preview
+            self.stop_preview()
+            
+            # Cleanup individual cameras
+            if self.pi_camera:
+                self.pi_camera.cleanup()
+                self.pi_camera = None
+            
+            if self.usb_camera:
+                self.usb_camera.cleanup()
+                self.usb_camera = None
+            
+            # Clear frame storage
+            with self._frame_lock:
+                self._pi_frame = None
+                self._usb_frame = None
+            
+            self.is_initialized = False
+            gc.collect()
+            time.sleep(0.3)
+            log_camera.info("DualCameraManager cleanup complete")
 
 
 # =============================================================================
