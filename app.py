@@ -357,24 +357,24 @@ class USBCameraController:
             self._initialize()
     
     def _find_usb_camera(self):
-        """Find USB camera by scanning /dev/video* for UVC devices."""
+        """Find USB camera by querying v4l2 for UVC devices only."""
         import subprocess
         
-        # Try the configured index first
+        # Try the configured index first (fast path)
         if self.camera_index is not None:
             cap = cv2.VideoCapture(self.camera_index, cv2.CAP_V4L2)
             if cap.isOpened():
+                # Set short timeout for test read
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 ret, _ = cap.read()
                 cap.release()
                 if ret:
                     log_camera.info(f"Using configured USB camera index: {self.camera_index}")
                     return self.camera_index
         
-        # Find USB camera by querying v4l2 devices
-        # Look for UVC devices (Logitech BRIO, etc.) vs Pi camera (rp1-cfe)
-        usb_devices = []
+        # Use v4l2-ctl to find ONLY video capture devices (not media controllers)
+        usb_video_indices = []
         try:
-            # List all video devices
             result = subprocess.run(['v4l2-ctl', '--list-devices'], 
                                    capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
@@ -385,42 +385,48 @@ class USBCameraController:
                         current_device = line.strip()
                     elif line.strip().startswith('/dev/video'):
                         dev = line.strip()
-                        # Skip rp1-cfe devices (Pi camera)
+                        # Only consider USB/UVC devices, skip Pi camera (rp1)
                         if current_device and 'rp1' not in current_device.lower():
-                            # Extract index from /dev/videoN
                             try:
                                 idx = int(dev.replace('/dev/video', ''))
-                                usb_devices.append((idx, current_device, dev))
-                                log_camera.debug(f"Found USB camera: {current_device} at {dev}")
+                                # Only add the FIRST video device per camera (captures video)
+                                # Subsequent ones are usually metadata/control interfaces
+                                if not usb_video_indices or usb_video_indices[-1][0] != idx - 1:
+                                    usb_video_indices.append((idx, current_device))
+                                    log_camera.info(f"Found USB video device: {current_device} -> /dev/video{idx}")
                             except ValueError:
                                 pass
         except Exception as e:
-            log_camera.debug(f"v4l2-ctl failed: {e}, falling back to scan")
+            log_camera.debug(f"v4l2-ctl failed: {e}")
         
-        # Try found USB devices first
-        for idx, name, dev in usb_devices:
-            log_camera.info(f"Trying USB camera: {name} at index {idx}")
+        # Try found USB devices (should be quick - only real video devices)
+        for idx, name in usb_video_indices:
+            log_camera.info(f"Trying USB camera at index {idx}")
             cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
             if cap.isOpened():
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 ret, frame = cap.read()
                 cap.release()
                 if ret and frame is not None:
-                    log_camera.info(f"USB camera found: {name} at index {idx}")
+                    log_camera.info(f"USB camera ready: {name} at index {idx}")
                     return idx
+                else:
+                    log_camera.debug(f"Index {idx} opened but couldn't read frame")
         
-        # Fallback: scan higher indices that aren't typically used by Pi camera
-        # Pi camera uses /dev/video0-7, USB cameras usually get /dev/video8+
-        for idx in [8, 9, 10, 11, 12, 13, 14, 15, 2, 3, 4]:
-            log_camera.debug(f"Scanning index {idx} for USB camera")
+        # Quick fallback: try common USB camera indices (8, 10 are typical for BRIO)
+        # Skip indices that are known to timeout (20+)
+        for idx in [8, 10, 2, 4]:
+            log_camera.debug(f"Quick scan index {idx}")
             cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
             if cap.isOpened():
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 ret, frame = cap.read()
                 cap.release()
                 if ret and frame is not None:
-                    log_camera.info(f"USB camera found at index {idx} (fallback scan)")
+                    log_camera.info(f"USB camera found at index {idx}")
                     return idx
         
-        log_camera.warning("No USB camera found after scanning all indices")
+        log_camera.warning("No USB camera found")
         return None
     
     def _initialize(self):
@@ -1100,6 +1106,18 @@ class PiCameraController:
             # Stop video recording first
             self.stop_video_recording()
             
+            # Stop preview flag first
+            self.stop_preview_flag = True
+            
+            # Destroy OpenCV windows BEFORE stopping thread
+            if CV2_AVAILABLE:
+                try:
+                    cv2.destroyAllWindows()
+                    for _ in range(10):
+                        cv2.waitKey(1)
+                except:
+                    pass
+            
             # Stop preview and wait for thread to fully terminate
             self.stop_preview()
             
@@ -1117,8 +1135,8 @@ class PiCameraController:
                 except Exception as e:
                     log_camera.debug(f"Camera stop exception (may be expected): {e}")
                 
-                # Small delay between stop and close
-                time.sleep(0.1)
+                # Delay between stop and close
+                time.sleep(0.2)
                 
                 try:
                     self.camera.close()
@@ -1139,12 +1157,12 @@ class PiCameraController:
             
             # Force garbage collection multiple times to ensure cleanup
             gc.collect()
-            time.sleep(0.2)
+            time.sleep(0.3)
             gc.collect()
             
             # Allow hardware to fully release before potential re-init
             # This longer delay is necessary for libcamera to release /dev/video* handles
-            time.sleep(0.5)
+            time.sleep(1.0)
             log_camera.info("Pi camera cleanup complete")
     
     @staticmethod
@@ -1344,13 +1362,18 @@ class DualCameraManager:
                 log_camera.error(f"Combined preview error: {e}")
                 time.sleep(0.1)
         
+        # Properly destroy window and flush events
         try:
             cv2.destroyWindow(self.PREVIEW_WINDOW)
-            cv2.waitKey(1)
+            for _ in range(5):
+                cv2.waitKey(1)
             cv2.destroyAllWindows()
-            cv2.waitKey(1)
+            for _ in range(5):
+                cv2.waitKey(1)
         except:
             pass
+        
+        log_camera.info("Combined preview loop ended")
     
     def stop_preview(self):
         """Stop combined preview."""
@@ -1456,20 +1479,40 @@ class DualCameraManager:
         with self._cleanup_lock:
             log_camera.info("Cleaning up DualCameraManager")
             
-            # Stop video recording
+            # Stop video recording first
             self.stop_video_recording()
             
-            # Stop combined preview
+            # Set stop flag
+            self.stop_preview_flag = True
+            
+            # Destroy OpenCV windows BEFORE stopping threads
+            if CV2_AVAILABLE:
+                try:
+                    cv2.destroyAllWindows()
+                    for _ in range(10):
+                        cv2.waitKey(1)
+                except:
+                    pass
+            
+            # Stop combined preview thread
             self.stop_preview()
             
-            # Cleanup individual cameras
-            if self.pi_camera:
-                self.pi_camera.cleanup()
-                self.pi_camera = None
+            # Wait for preview thread
+            if self.preview_thread and self.preview_thread.is_alive():
+                self.preview_thread.join(timeout=3.0)
+            self.preview_thread = None
             
+            # Cleanup USB camera first (faster)
             if self.usb_camera:
+                log_camera.debug("Cleaning up USB camera")
                 self.usb_camera.cleanup()
                 self.usb_camera = None
+            
+            # Cleanup Pi camera (needs more time)
+            if self.pi_camera:
+                log_camera.debug("Cleaning up Pi camera")
+                self.pi_camera.cleanup()
+                self.pi_camera = None
             
             # Clear frame storage
             with self._frame_lock:
@@ -1477,8 +1520,15 @@ class DualCameraManager:
                 self._usb_frame = None
             
             self.is_initialized = False
+            self.preview_active = False
+            
+            # Force garbage collection
             gc.collect()
-            time.sleep(0.3)
+            time.sleep(0.5)
+            gc.collect()
+            
+            # Extra delay for hardware release
+            time.sleep(1.0)
             log_camera.info("DualCameraManager cleanup complete")
 
 
