@@ -1,0 +1,12 @@
+# Table Controle Carapace - Python Dependencies
+# Install: pip3 install -r requirements.txt --break-system-packages
+
+# Image processing
+Pillow>=10.0.0
+opencv-python>=4.8.0
+
+# Note: The following are typically pre-installed on Raspberry Pi OS
+# and should NOT be installed via pip (use system packages):
+#   - picamera2 (sudo apt install python3-picamera2)
+#   - gpiozero (pre-installed on Raspberry Pi OS)
+#   - libcamera (sudo apt install libcamera-apps)
