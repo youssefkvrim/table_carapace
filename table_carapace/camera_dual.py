@@ -89,13 +89,18 @@ class DualCameraManager:
         return True
 
     def _combined_preview_loop(self):
-        """Combined preview showing both cameras side-by-side in ONE window."""
+        """Combined preview showing both cameras side-by-side in ONE window.
+
+        Pressing Q closes the preview window but does NOT stop video recording.
+        The loop continues capturing frames for recording until stop_preview_flag is set.
+        """
+        preview_window_open = True
         try:
             cv2.namedWindow(self.PREVIEW_WINDOW, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(self.PREVIEW_WINDOW, 1280, 480)
         except Exception as e:
             log_camera.error(f"Failed to create combined preview window: {e}")
-            return
+            preview_window_open = False
 
         preview_w, preview_h = CONFIG.USB_CAMERA_PREVIEW_SIZE
 
@@ -118,6 +123,7 @@ class DualCameraManager:
                             with self._frame_lock:
                                 self._pi_frame = pi_frame.copy()
 
+                            # Always record if recording is active
                             if self.video_recording and self.pi_video_writer:
                                 self.pi_video_writer.write(pi_frame)
                     except Exception as e:
@@ -133,54 +139,79 @@ class DualCameraManager:
                                 with self._frame_lock:
                                     self._usb_frame = usb_frame.copy()
 
+                                # Always record if recording is active
                                 if self.video_recording and self.usb_video_writer:
                                     self.usb_video_writer.write(usb_frame)
                     except Exception as e:
                         log_camera.debug(f"Error getting USB frame: {e}")
 
-                # Create combined frame
-                if pi_frame is not None and usb_frame is not None:
-                    combined = cv2.hconcat([pi_frame, usb_frame])
-                    cv2.putText(combined, "Pi Camera V3", (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                                1, (0, 255, 0), 2, cv2.LINE_AA)
-                    cv2.putText(combined, "USB Camera", (preview_w + 10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                                1, (0, 255, 0), 2, cv2.LINE_AA)
-                elif pi_frame is not None:
-                    combined = pi_frame
-                    cv2.putText(combined, "Pi Camera V3", (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                                1, (0, 255, 0), 2, cv2.LINE_AA)
-                elif usb_frame is not None:
-                    combined = usb_frame
-                    cv2.putText(combined, "USB Camera", (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                                1, (0, 255, 0), 2, cv2.LINE_AA)
+                # Only display if preview window is still open
+                if preview_window_open:
+                    # Create combined frame
+                    if pi_frame is not None and usb_frame is not None:
+                        combined = cv2.hconcat([pi_frame, usb_frame])
+                        cv2.putText(combined, "Pi Camera V3", (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                                    1, (0, 255, 0), 2, cv2.LINE_AA)
+                        cv2.putText(combined, "USB Camera", (preview_w + 10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                                    1, (0, 255, 0), 2, cv2.LINE_AA)
+                    elif pi_frame is not None:
+                        combined = pi_frame
+                        cv2.putText(combined, "Pi Camera V3", (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                                    1, (0, 255, 0), 2, cv2.LINE_AA)
+                    elif usb_frame is not None:
+                        combined = usb_frame
+                        cv2.putText(combined, "USB Camera", (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                                    1, (0, 255, 0), 2, cv2.LINE_AA)
+                    else:
+                        time.sleep(0.05)
+                        continue
+
+                    # Add angle overlay
+                    angle_text = f"Angle: {int(self.current_angle):03d} deg"
+                    cv2.putText(combined, angle_text, (combined.shape[1] - 200, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+
+                    cv2.imshow(self.PREVIEW_WINDOW, combined)
+
+                    if cv2.waitKey(16) & 0xFF == ord('q'):
+                        # Close preview window but keep loop running for recording
+                        try:
+                            cv2.destroyWindow(self.PREVIEW_WINDOW)
+                            for _ in range(5):
+                                cv2.waitKey(1)
+                            cv2.destroyAllWindows()
+                            for _ in range(5):
+                                cv2.waitKey(1)
+                        except Exception:
+                            pass
+                        preview_window_open = False
+                        if self.video_recording:
+                            print("\n  [PREVIEW] Window closed — video recording continues")
+                        else:
+                            break  # No recording active, exit the loop
                 else:
-                    time.sleep(0.05)
-                    continue
-
-                # Add angle overlay
-                angle_text = f"Angle: {int(self.current_angle):03d} deg"
-                cv2.putText(combined, angle_text, (combined.shape[1] - 200, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-
-                cv2.imshow(self.PREVIEW_WINDOW, combined)
-
-                if cv2.waitKey(16) & 0xFF == ord('q'):
-                    break
+                    # No preview window — just pace the loop for recording
+                    if not self.video_recording:
+                        break  # Nothing left to do
+                    if pi_frame is None and usb_frame is None:
+                        time.sleep(0.05)
+                    else:
+                        time.sleep(0.033)  # ~30 fps capture rate
 
             except Exception as e:
                 log_camera.error(f"Combined preview error: {e}")
                 time.sleep(0.1)
 
-        # Properly destroy window and flush events
-        try:
-            cv2.destroyWindow(self.PREVIEW_WINDOW)
-            for _ in range(5):
-                cv2.waitKey(1)
-            cv2.destroyAllWindows()
-            for _ in range(5):
-                cv2.waitKey(1)
-        except Exception as e:
-            log_camera.debug(f"Combined preview window cleanup: {e}")
+        if preview_window_open:
+            try:
+                cv2.destroyWindow(self.PREVIEW_WINDOW)
+                for _ in range(5):
+                    cv2.waitKey(1)
+                cv2.destroyAllWindows()
+                for _ in range(5):
+                    cv2.waitKey(1)
+            except Exception as e:
+                log_camera.debug(f"Combined preview window cleanup: {e}")
 
         log_camera.info("Combined preview loop ended")
 

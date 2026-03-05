@@ -41,6 +41,8 @@ class PiCameraController:
         self.video_recording = False
         self.video_frame_count = 0
         self.current_angle = 0
+        self._recording_thread = None
+        self._stop_recording_flag = False
 
         if CAMERA_AVAILABLE:
             self._initialize()
@@ -90,20 +92,25 @@ class PiCameraController:
         return True
 
     def _opencv_preview_loop(self):
-        """OpenCV preview loop running in separate thread."""
+        """OpenCV preview loop running in separate thread.
+
+        Pressing Q closes the preview window but does NOT stop video recording.
+        The loop continues capturing frames for recording until stop_preview_flag is set.
+        """
         try:
             cv2.destroyWindow(self.PREVIEW_WINDOW)
             cv2.waitKey(1)
         except Exception as e:
             log_camera.debug(f"Stale preview window cleanup: {e}")
 
+        preview_window_open = True
         try:
             cv2.namedWindow(self.PREVIEW_WINDOW, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(self.PREVIEW_WINDOW, 800, 600)
             cv2.waitKey(1)
         except Exception as e:
             print(f"  [CAMERA] Failed to create preview window: {e}")
-            return
+            preview_window_open = False
 
         frame_count = 0
         error_count = 0
@@ -130,15 +137,35 @@ class PiCameraController:
                 error_count = 0
                 frame_count += 1
 
+                # Always record frames if recording is active
                 if self.video_recording:
                     self.record_frame(frame_bgr)
 
-                display_frame = self.add_angle_overlay(frame_bgr.copy(), self.current_angle, is_still=False)
-                cv2.imshow(self.PREVIEW_WINDOW, display_frame)
+                # Only display if preview window is still open
+                if preview_window_open:
+                    display_frame = self.add_angle_overlay(frame_bgr.copy(), self.current_angle, is_still=False)
+                    cv2.imshow(self.PREVIEW_WINDOW, display_frame)
 
-                key = cv2.waitKey(16) & 0xFF
-                if key == ord('q'):
-                    break
+                    key = cv2.waitKey(16) & 0xFF
+                    if key == ord('q'):
+                        # Close preview window but keep loop running for recording
+                        try:
+                            cv2.destroyWindow(self.PREVIEW_WINDOW)
+                            cv2.waitKey(1)
+                            cv2.destroyAllWindows()
+                            cv2.waitKey(1)
+                        except Exception:
+                            pass
+                        preview_window_open = False
+                        if self.video_recording:
+                            print("\n  [PREVIEW] Window closed — video recording continues")
+                        else:
+                            break  # No recording active, exit the loop
+                else:
+                    # No preview window — just pace the loop for recording
+                    if not self.video_recording:
+                        break  # Nothing left to do
+                    time.sleep(0.033)  # ~30 fps capture rate
 
             except Exception as e:
                 error_count += 1
@@ -147,13 +174,51 @@ class PiCameraController:
                     break
                 time.sleep(0.1)
 
-        try:
-            cv2.destroyWindow(self.PREVIEW_WINDOW)
-            cv2.waitKey(1)
-            cv2.destroyAllWindows()
-            cv2.waitKey(1)
-        except Exception as e:
-            log_camera.debug(f"Pi preview window cleanup: {e}")
+        if preview_window_open:
+            try:
+                cv2.destroyWindow(self.PREVIEW_WINDOW)
+                cv2.waitKey(1)
+                cv2.destroyAllWindows()
+                cv2.waitKey(1)
+            except Exception as e:
+                log_camera.debug(f"Pi preview window cleanup: {e}")
+
+    def _recording_loop(self):
+        """Background recording loop — captures lores frames for video when no preview is active."""
+        log_camera.info("Pi camera recording loop started (no preview)")
+        error_count = 0
+        max_errors = 10
+
+        while not self._stop_recording_flag and self.video_recording:
+            try:
+                if not self.is_initialized or self.camera is None:
+                    break
+
+                frame = self.camera.capture_array("lores")
+                if frame is None:
+                    error_count += 1
+                    if error_count >= max_errors:
+                        log_camera.error("Recording loop: too many frame errors")
+                        break
+                    continue
+
+                if CONFIG.PREVIEW_SWAP_RB:
+                    frame_bgr = frame
+                else:
+                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+                error_count = 0
+                self.record_frame(frame_bgr)
+                time.sleep(0.033)  # ~30 fps capture rate
+
+            except Exception as e:
+                error_count += 1
+                if error_count >= max_errors:
+                    log_camera.error(f"Recording loop error: {e}")
+                    break
+                time.sleep(0.1)
+
+        log_camera.info(f"Pi camera recording loop ended ({self.video_frame_count} frames)")
 
     def _start_native_preview(self):
         """Start preview using Picamera2 native preview."""
@@ -291,6 +356,9 @@ class PiCameraController:
         Video is recorded at preview resolution (CONFIG.CAMERA_PREVIEW_SIZE) for performance.
         Full resolution stills are captured separately during the scan.
 
+        If preview is running, frames are recorded from the preview loop.
+        If preview is NOT running, a dedicated recording loop is started.
+
         Codec priority: CONFIG.VIDEO_CODEC first, then fallbacks for compatibility.
         """
         if not CV2_AVAILABLE:
@@ -312,6 +380,14 @@ class PiCameraController:
                     self.video_frame_count = 0
                     log_camera.info(f"Video recording started: {filepath} (codec={codec}, {frame_size[0]}x{frame_size[1]}@{fps}fps)")
                     print(f"  [VIDEO] Recording at {frame_size[0]}x{frame_size[1]} using codec: {codec}")
+
+                    # If no preview thread is running, start a dedicated recording loop
+                    if not (self.preview_thread and self.preview_thread.is_alive()):
+                        self._stop_recording_flag = False
+                        self._recording_thread = threading.Thread(target=self._recording_loop, daemon=True)
+                        self._recording_thread.start()
+                        log_camera.info("Started dedicated recording thread (no preview)")
+
                     return True
                 self.video_writer.release()
                 log_camera.debug(f"Codec {codec} failed, trying next")
@@ -344,10 +420,17 @@ class PiCameraController:
             log_camera.debug(f"Frame recording error: {e}")
 
     def stop_video_recording(self):
-        """Stop video recording and release writer."""
+        """Stop video recording, wait for recording thread, and release writer."""
         was_recording = self.video_recording
         frame_count = getattr(self, 'video_frame_count', 0)
         self.video_recording = False
+        self._stop_recording_flag = True
+
+        # Wait for dedicated recording thread to finish
+        if self._recording_thread and self._recording_thread.is_alive():
+            self._recording_thread.join(timeout=2.0)
+        self._recording_thread = None
+
         if self.video_writer is not None:
             try:
                 self.video_writer.release()
@@ -378,6 +461,7 @@ class PiCameraController:
             self.stop_video_recording()
 
             self.stop_preview_flag = True
+            self._stop_recording_flag = True
             self.stop_preview()
 
             if self.preview_thread is not None:
